@@ -1,0 +1,68 @@
+name: fleet-ci
+
+on:
+  workflow_call:
+    inputs:
+      kernel-role:
+        description: "Run the boundary gate with --role kernel (true only in the kernel repository)"
+        type: boolean
+        default: false
+      runs-on:
+        description: "Runner label — ubuntu-latest until the org runner pool exists, then the self-hosted label"
+        type: string
+        default: "ubuntu-latest"
+    secrets:
+      FLEET_TOKEN:
+        description: "Read-only token that can fetch SanctuaryGG/kernel (not needed in the kernel repository itself)"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 45
+    env:
+      FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: |
+          rustup set profile minimal
+          rustup show
+
+      - name: Cache cargo (hosted runners)
+        if: inputs.runs-on == 'ubuntu-latest'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Kernel git credential helper (FLEET_TOKEN, never logged)
+        if: env.FLEET_TOKEN != ''
+        run: git config --global credential.helper '!f() { echo username=x-access-token; echo password="$FLEET_TOKEN"; }; f'
+
+      - name: Gate — boundary selftest
+        run: sh scripts/check-boundaries.sh --selftest
+
+      - name: Gate — boundary gate
+        if: inputs.kernel-role == false
+        run: sh scripts/check-boundaries.sh
+
+      - name: Gate — boundary gate (kernel role)
+        if: inputs.kernel-role == true
+        run: sh scripts/check-boundaries.sh --role kernel
+
+      - name: Gate — rustfmt
+        run: cargo fmt --all --check
+
+      - name: Gate — clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Gate — tests
+        run: cargo test

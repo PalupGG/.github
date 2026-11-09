@@ -1,0 +1,68 @@
+# Org-level GitHub Actions runner pool on the owned cluster (ADR-PLT-0013).
+# Founder-applied; agents never kubectl-apply this (fleet rule 10).
+apiVersion: v1
+kind: Service
+metadata:
+  name: actions-runner
+  namespace: ci-runners
+spec:
+  clusterIP: None
+  selector: { app: actions-runner }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: actions-runner
+  namespace: ci-runners
+spec:
+  serviceName: actions-runner
+  replicas: 2
+  selector:
+    matchLabels: { app: actions-runner }
+  template:
+    metadata:
+      labels: { app: actions-runner }
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: runner
+          image: ghcr.io/actions/actions-runner:2.327.1
+          env:
+            - name: RUNNER_ALLOW_RUNASROOT
+              value: "false"
+            - name: RUNNER_ORG_URL
+              value: https://github.com/SanctuaryGG
+            - name: RUNNER_LABELS
+              value: "self-hosted,Linux,X64,sanctuary-ci"
+            - name: RUNNER_NAME_PREFIX
+              value: "darkcloud-"
+            - name: RUNNER_TOKEN
+              valueFrom:
+                secretKeyRef: { name: runner-registration, key: token }
+            - name: RUNNER_WORKDIR
+              value: /data/work
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              if [ ! -f /data/.runner ]; then
+                ./config.sh --unattended --url "$RUNNER_ORG_URL" --token "$RUNNER_TOKEN" \
+                  --labels "$RUNNER_LABELS" --name "$RUNNER_NAME_PREFIX$(hostname)" \
+                  --work "$RUNNER_WORKDIR"
+              fi
+              exec ./run.sh
+          resources:
+            requests: { cpu: "500m", memory: 1Gi }
+            limits: { cpu: "2", memory: 4Gi }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 20Gi } }
