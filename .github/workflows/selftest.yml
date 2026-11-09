@@ -1,0 +1,16 @@
+name: selftest
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compose-check:
+    # Calls the reusable workflow with runs-on ubuntu-latest; jobs failing at the
+    # boundary-gate step (this repo has no scripts/) proves composition works.
+    uses: SanctuaryGG/.github/.github/workflows/fleet-ci.yml@main
+    with:
+      runs-on: ubuntu-latest
