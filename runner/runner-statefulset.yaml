@@ -40,7 +40,7 @@ spec:
             - name: RUNNER_LABELS
               value: "self-hosted,Linux,X64,sanctuary-ci"
             - name: RUNNER_NAME_PREFIX
-              value: "darkcloud-"
+              value: "sanctuary-"
             - name: RUNNER_TOKEN
               valueFrom:
                 secretKeyRef: { name: runner-registration, key: token }
