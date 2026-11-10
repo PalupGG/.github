@@ -2,6 +2,7 @@ name: selftest
 on:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -9,8 +10,13 @@ permissions:
 
 jobs:
   compose-check:
-    # Calls the reusable workflow with runs-on ubuntu-latest; jobs failing at the
-    # boundary-gate step (this repo has no scripts/) proves composition works.
+    # Calls the reusable workflow; jobs failing at the boundary-gate step (this repo
+    # has no scripts/) proves composition works.
     uses: SanctuaryGG/.github/.github/workflows/fleet-ci.yml@main
+    with:
+      runs-on: ubuntu-latest
+  release-compose-check:
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: SanctuaryGG/.github/.github/workflows/fleet-release.yml@main
     with:
       runs-on: ubuntu-latest
