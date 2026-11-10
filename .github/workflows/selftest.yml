@@ -18,5 +18,7 @@ jobs:
   release-compose-check:
     if: startsWith(github.ref, 'refs/tags/v')
     uses: SanctuaryGG/.github/.github/workflows/fleet-release.yml@main
+    permissions:
+      contents: write # reusable workflows cannot elevate: the caller must grant what the callee needs
     with:
       runs-on: ubuntu-latest
