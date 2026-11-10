@@ -1,0 +1,94 @@
+name: fleet-release
+
+# The release half of the pipeline (ADR-PLT-0009/0013): a vX.Y.Z tag re-runs the FULL
+# gate suite on the exact tagged commit, proves the release profile compiles, and
+# publishes a GitHub Release with generated notes. No tag, no release — main alone
+# never ships (staging follows main; prod follows tags via the gitops PR).
+
+on:
+  workflow_call:
+    inputs:
+      kernel-role:
+        description: "Run the boundary gate with --role kernel (true only in the kernel repository)"
+        type: boolean
+        default: false
+      runs-on:
+        description: "Runner label — ubuntu-latest until the org runner pool exists"
+        type: string
+        default: "ubuntu-latest"
+    secrets:
+      FLEET_TOKEN:
+        description: "Read-only token that can fetch SanctuaryGG/kernel (not needed in the kernel repository)"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 60
+    permissions:
+      contents: write # create the GitHub Release object for the tag (the tag itself is founder-only)
+    env:
+      FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout (full history for release notes)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Refuse to run off a tag
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          echo "fleet-release only runs on vX.Y.Z tags (ref: ${{ github.ref }})"
+          exit 1
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: |
+          rustup set profile minimal
+          rustup show
+
+      - name: Cache cargo (hosted runners)
+        if: inputs.runs-on == 'ubuntu-latest'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Kernel git credential helper (FLEET_TOKEN, never logged)
+        if: env.FLEET_TOKEN != ''
+        run: git config --global credential.helper '!f() { echo username=x-access-token; echo password="$FLEET_TOKEN"; }; f'
+
+      - name: Gate — boundary selftest
+        run: sh scripts/check-boundaries.sh --selftest
+
+      - name: Gate — boundary gate
+        if: inputs.kernel-role == false
+        run: sh scripts/check-boundaries.sh
+
+      - name: Gate — boundary gate (kernel role)
+        if: inputs.kernel-role == true
+        run: sh scripts/check-boundaries.sh --role kernel
+
+      - name: Gate — rustfmt
+        run: cargo fmt --all --check
+
+      - name: Gate — clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Gate — full test suite (the regression pass)
+        run: cargo test
+
+      - name: Gate — release profile builds
+        run: cargo build --release
+
+      - name: Publish the GitHub Release for ${{ github.ref_name }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists; leaving it untouched"
+          else
+            gh release create "$TAG" --verify-tag --generate-notes \
+              --title "$TAG" \
+              --notes "Release $TAG. All five gates re-run on this exact tag commit in CI (selftest, boundary gate, fmt, clippy -D warnings, full test suite) plus a release-profile build. See the checks on this tag."
+          fi
