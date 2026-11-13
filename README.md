@@ -8,7 +8,7 @@ ADR-PLT-0010 #3). Documentation of the whole pipeline lives in
 
 | Path | What |
 |---|---|
-| `.github/workflows/fleet-ci.yml` | The reusable workflow: the five gates (boundary selftest, boundary gate — service or kernel role, `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`) on the pinned toolchain, with the `FLEET_TOKEN` kernel fetch wired through the git CLI credential helper. |
+| `.github/workflows/fleet-ci.yml` | The reusable workflow: the five gates (boundary selftest, boundary gate — service or kernel role, `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`) on the pinned toolchain, with the `FLEET_TOKEN` kernel fetch wired through the git CLI credential helper — plus an opt-in `postgres:17-alpine` service for database-backed suites. |
 | `runner/` | The self-hosted runner for the owned cluster: manifest + bootstrap instructions. Not applied by agents; cluster changes are founder actions. |
 
 ## How a repository calls it
@@ -28,6 +28,13 @@ jobs:
 ```
 
 The kernel repository adds `with: { kernel-role: true }`.
+
+A repository with database-backed test suites opts in with
+`with: { postgres: true, postgres-env: <CONNECTION_ENV_VAR> }`: the same gates then run beside
+a `postgres:17-alpine` service (dummy job-local password, `pg_isready` health gate) with
+`<CONNECTION_ENV_VAR>` set to `postgres://postgres:<password>@localhost:5432/<postgres-database>`
+(`postgres-database` defaults to `test`).
+
 The SHA is bumped deliberately, in a PR, when the workflow changes — never a branch, never
 a floating tag.
 
