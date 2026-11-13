@@ -1,0 +1,63 @@
+name: fleet-image
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: "Runner label — ubuntu-latest until the org runner pool exists, then the self-hosted label"
+        type: string
+        default: "ubuntu-latest"
+      service:
+        description: "Service name — the image is ghcr.io/palupgg/<service>"
+        type: string
+        required: true
+    secrets:
+      FLEET_TOKEN:
+        description: "Read-only token that can fetch PalupGG/kernel (not needed in the kernel repository itself)"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write   # this job only (AGENTS §6); everything else stays contents: read
+    env:
+      FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the pinned toolchain + musl target
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          rustup set profile minimal
+          rustup show
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Kernel git credential helper (FLEET_TOKEN, never logged)
+        if: env.FLEET_TOKEN != ''
+        run: git config --global credential.helper '!f() { echo username=x-access-token; echo password="***"; }; f'
+
+      # The binary is built OUTSIDE docker on purpose: the private kernel fetch rides
+      # FLEET_TOKEN through the git CLI and must never enter an image layer or build
+      # context. The Dockerfile only packages the finished static binary.
+      - name: Build static release binary
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: docker login (job GITHUB_TOKEN, no PAT)
+        run: echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Build and push ghcr.io/palupgg/${{ inputs.service }}:main-<sha>
+        run: |
+          TAG="main-${GITHUB_SHA:0:7}"
+          docker build -t "ghcr.io/palupgg/${{ inputs.service }}:${TAG}" .
+          docker push "ghcr.io/palupgg/${{ inputs.service }}:${TAG}"
