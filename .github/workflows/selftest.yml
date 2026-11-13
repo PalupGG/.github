@@ -19,6 +19,8 @@ jobs:
     # Same proof for fleet-image: the job must START and fail at a real step (no
     # Cargo.toml in this repo) — that is composition proven, not a broken callee.
     uses: PalupGG/.github/.github/workflows/fleet-image.yml@main
+    permissions:
+      packages: write # reusable workflows cannot elevate: the caller must grant what the callee needs
     with:
       runs-on: ubuntu-latest
       service: selftest
