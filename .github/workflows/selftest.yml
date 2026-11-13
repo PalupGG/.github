@@ -20,6 +20,7 @@ jobs:
     # Cargo.toml in this repo) — that is composition proven, not a broken callee.
     uses: PalupGG/.github/.github/workflows/fleet-image.yml@main
     permissions:
+      contents: read  # a job-level permissions block is exhaustive: grant everything the callee needs
       packages: write # reusable workflows cannot elevate: the caller must grant what the callee needs
     with:
       runs-on: ubuntu-latest
