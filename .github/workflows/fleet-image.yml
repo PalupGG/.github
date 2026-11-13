@@ -43,7 +43,7 @@ jobs:
 
       - name: Kernel git credential helper (FLEET_TOKEN, never logged)
         if: env.FLEET_TOKEN != ''
-        run: git config --global credential.helper '!f() { echo username=x-access-token; echo password="***"; }; f'
+        run: git config --global credential.helper '!f() { echo username=x-access-token; echo password="$FLEET_TOKEN"; }; f'
 
       # The binary is built OUTSIDE docker on purpose: the private kernel fetch rides
       # FLEET_TOKEN through the git CLI and must never enter an image layer or build
