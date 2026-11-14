@@ -1,0 +1,44 @@
+# Egress-only network policy for the org runner pool (issue #10, ADR-PLT-0015 #3).
+# Ingress: default-denied from outside the ci-runners namespace — the runners poll
+# GitHub over HTTPS, nothing needs to reach them. Egress: DNS and public HTTPS only.
+# Founder-applied with the rest of runner/; agents never kubectl-apply (rule 10).
+# Enforcement requires a policy-enforcing CNI (Calico, Cilium and friends); on a CNI
+# without NetworkPolicy support this file is inert.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-only
+  namespace: ci-runners
+spec:
+  podSelector:
+    matchLabels: { app: actions-runner }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # Deny-by-default: only pods inside ci-runners may talk to the runners.
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ci-runners }
+  egress:
+    # DNS — UDP and TCP 53 to the cluster nameservers, scoped to the kube-system
+    # namespace so no assumption about the DNS pods' own labels is needed.
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Public HTTPS only: GitHub endpoints (runner protocol, api, checkout,
+    # artifacts), GHCR, and the crates index + rust toolchain CDN the gates fetch.
+    # Every private, link-local and CGNAT range is excepted, so the runner can
+    # never reach cluster services, node-local metadata or any private network.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - { protocol: TCP, port: 443 }

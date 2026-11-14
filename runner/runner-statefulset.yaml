@@ -1,5 +1,6 @@
-# Org-level GitHub Actions runner pool on the owned cluster (ADR-PLT-0013).
-# Founder-applied; agents never kubectl-apply this (fleet rule 10).
+# Org-level GitHub Actions runner pool on the owned cluster (ADR-PLT-0015 #3).
+# Founder-applied via the runbook in runner/README.md; agents never kubectl-apply
+# this (fleet rule 10).
 apiVersion: v1
 kind: Service
 metadata:
@@ -36,14 +37,14 @@ spec:
             - name: RUNNER_ALLOW_RUNASROOT
               value: "false"
             - name: RUNNER_ORG_URL
-              value: https://github.com/SanctuaryGG
+              value: https://github.com/PalupGG
             - name: RUNNER_LABELS
-              value: "self-hosted,Linux,X64,sanctuary-ci"
+              value: "palupgg-ci" # self-hosted/Linux/X64 are added by the runner itself
             - name: RUNNER_NAME_PREFIX
-              value: "sanctuary-"
+              value: "palupgg-"
             - name: RUNNER_TOKEN
               valueFrom:
-                secretKeyRef: { name: runner-registration, key: token }
+                secretKeyRef: { name: runner-reg, key: token }
             - name: RUNNER_WORKDIR
               value: /data/work
           command: ["/bin/sh", "-c"]
@@ -57,8 +58,8 @@ spec:
               fi
               exec ./run.sh
           resources:
-            requests: { cpu: "500m", memory: 1Gi }
-            limits: { cpu: "2", memory: 4Gi }
+            requests: { cpu: "2", memory: 4Gi } # cargo builds; burstable to the limits
+            limits: { cpu: "4", memory: 8Gi }
           volumeMounts:
             - { name: data, mountPath: /data }
   volumeClaimTemplates:
