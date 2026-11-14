@@ -1,0 +1,202 @@
+name: fleet-e2e
+
+# The application-level e2e half (issue #9, foundation of roadmap R6): fleet-ci.yml proves
+# the code passes its gates; this workflow proves the BUILT application boots in a clean
+# environment — build, run the real server (cargo run), wait for the health path, then run
+# the repo's e2e suite against the live process. No browser automation yet (later, on top).
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: "Runner label — ubuntu-latest until the org runner pool exists, then the self-hosted label"
+        type: string
+        default: "ubuntu-latest"
+      postgres:
+        description: "Run the e2e beside a postgres:17-alpine service and point postgres-env at it"
+        type: boolean
+        default: false
+      postgres-env:
+        description: "Env var the app (and e2e suite) read the connection URL from; set to the service URL when postgres is true"
+        type: string
+        default: "DATABASE_URL"
+      postgres-database:
+        description: "Database the service creates and the URL points at (when postgres is true)"
+        type: string
+        default: "test"
+      app-port:
+        description: "Port the app binds via the PORT env var; the e2e suite sees the same value"
+        type: string
+        default: "8080"
+      health-path:
+        description: "Path polled on BIND:PORT for up to 60 s before the e2e suite runs — leading slash required"
+        type: string
+        default: "/healthz"
+      e2e-command:
+        description: "Command that runs the repo's e2e suite against the live app"
+        type: string
+        default: "cargo test --test e2e"
+    secrets:
+      FLEET_TOKEN:
+        description: "Read-only token that can fetch SanctuaryGG/kernel (not needed in the kernel repository itself)"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    if: inputs.postgres == false
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 45
+    env:
+      FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
+      CARGO_TERM_COLOR: always
+      BIND: 127.0.0.1
+      PORT: ${{ inputs.app-port }}
+      HEALTH_PATH: ${{ inputs.health-path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: |
+          rustup set profile minimal
+          rustup show
+
+      - name: Cache cargo (hosted runners)
+        if: inputs.runs-on == 'ubuntu-latest'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Kernel git credential helper (FLEET_TOKEN, never logged)
+        if: env.FLEET_TOKEN != ''
+        run: git config --global credential.helper '!f() { echo username=x-access-token; echo password="$FLEET_TOKEN"; }; f'
+
+      - name: Build the application
+        run: cargo build
+
+      # nohup: the step's shell exits immediately; nohup keeps cargo (and the server it
+      # spawns) alive across steps until the job's process tree is torn down.
+      - name: Start the application (background, logging to APP_LOG)
+        env:
+          APP_LOG: ${{ runner.temp }}/app.log
+        run: |
+          nohup cargo run >"$APP_LOG" 2>&1 &
+          echo "app starting (cargo pid $!), log: $APP_LOG"
+
+      - name: Wait for the health path (up to 60 s)
+        env:
+          APP_LOG: ${{ runner.temp }}/app.log
+        run: |
+          deadline=$((SECONDS + 60))
+          until curl -fsS --max-time 2 "http://${BIND}:${PORT}${HEALTH_PATH}" >/dev/null 2>&1; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::no answer on ${BIND}:${PORT}${HEALTH_PATH} within 60 s — last 100 app log lines:"
+              tail -n 100 "$APP_LOG" || true
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "app healthy: http://${BIND}:${PORT}${HEALTH_PATH}"
+
+      - name: E2E suite
+        run: ${{ inputs.e2e-command }}
+
+      - name: Upload the app log (failure path only)
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: app-log
+          path: ${{ runner.temp }}/app.log
+          if-no-files-found: warn # a build failure never started the app; don't mask it
+          retention-days: 7
+
+  e2e-postgres:
+    # The postgres opt-in. GitHub Actions has no conditional `services:` (actions/runner#822),
+    # so the opt-in is this twin of `e2e`, skipped unless postgres is true. Keep the steps
+    # in lockstep with `e2e` above.
+    if: inputs.postgres == true
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 45
+    env:
+      FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
+      CARGO_TERM_COLOR: always
+      BIND: 127.0.0.1
+      PORT: ${{ inputs.app-port }}
+      HEALTH_PATH: ${{ inputs.health-path }}
+      POSTGRES_PASSWORD: postgres # job-local dummy, never a secret; the service URL embeds it
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres # same dummy; services cannot read the job env context
+          POSTGRES_DB: ${{ inputs.postgres-database }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Point ${{ inputs.postgres-env }} at the Postgres service
+        run: echo "${{ inputs.postgres-env }}=postgres://postgres:${POSTGRES_PASSWORD}@localhost:5432/${{ inputs.postgres-database }}" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: |
+          rustup set profile minimal
+          rustup show
+
+      - name: Cache cargo (hosted runners)
+        if: inputs.runs-on == 'ubuntu-latest'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Kernel git credential helper (FLEET_TOKEN, never logged)
+        if: env.FLEET_TOKEN != ''
+        run: git config --global credential.helper '!f() { echo username=x-access-token; echo password="$FLEET_TOKEN"; }; f'
+
+      - name: Build the application
+        run: cargo build
+
+      # nohup: the step's shell exits immediately; nohup keeps cargo (and the server it
+      # spawns) alive across steps until the job's process tree is torn down.
+      - name: Start the application (background, logging to APP_LOG)
+        env:
+          APP_LOG: ${{ runner.temp }}/app.log
+        run: |
+          nohup cargo run >"$APP_LOG" 2>&1 &
+          echo "app starting (cargo pid $!), log: $APP_LOG"
+
+      - name: Wait for the health path (up to 60 s)
+        env:
+          APP_LOG: ${{ runner.temp }}/app.log
+        run: |
+          deadline=$((SECONDS + 60))
+          until curl -fsS --max-time 2 "http://${BIND}:${PORT}${HEALTH_PATH}" >/dev/null 2>&1; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::no answer on ${BIND}:${PORT}${HEALTH_PATH} within 60 s — last 100 app log lines:"
+              tail -n 100 "$APP_LOG" || true
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "app healthy: http://${BIND}:${PORT}${HEALTH_PATH}"
+
+      - name: E2E suite
+        run: ${{ inputs.e2e-command }}
+
+      - name: Upload the app log (failure path only)
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: app-log
+          path: ${{ runner.temp }}/app.log
+          if-no-files-found: warn # a build failure never started the app; don't mask it
+          retention-days: 7
