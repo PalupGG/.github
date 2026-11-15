@@ -66,4 +66,7 @@ spec:
     - metadata: { name: data }
       spec:
         accessModes: ["ReadWriteOnce"]
+        # The cluster's only StorageClass; it carries no default annotation, so the
+        # claim must name it or the pod stays Pending on an unbound PVC.
+        storageClassName: local-path
         resources: { requests: { storage: 20Gi } }
