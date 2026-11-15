@@ -1,0 +1,117 @@
+name: fleet-worker
+
+# Build and deploy a Cloudflare Worker from a fleet service repo.
+#
+# Ownership: this workflow owns the Worker script, assets, and version via
+# wrangler. DNS, the tunnel, WAF, and the Worker custom domain stay in
+# Terraform Cloud (gitops/edge); this workflow never touches them.
+#
+# A service repo calls this with a build command and the Wrangler config path.
+# The caller keeps only its thin `site.yml` / `worker.yml`.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: Service name used for the build artifact.
+        required: true
+        type: string
+      worker_name:
+        description: Cloudflare Worker name (must match the Wrangler config).
+        required: true
+        type: string
+      config_path:
+        description: Path to the Wrangler config.
+        required: true
+        type: string
+      assets_dir:
+        description: Directory containing the built static assets.
+        required: true
+        type: string
+      build_command:
+        description: Command that produces the static assets.
+        required: true
+        type: string
+      environment:
+        description: GitHub environment (staging or prod).
+        required: false
+        type: string
+        default: staging
+      cloudflare_account_id:
+        description: Cloudflare account ID.
+        required: true
+        type: string
+    secrets:
+      FLEET_TOKEN:
+        description: Read token for the private kernel dependency.
+        required: false
+      CLOUDFLARE_API_TOKEN:
+        description: Workers Scripts Edit token.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # The Rust build needs a C linker; the minimal self-hosted runner image has
+    # none and its egress policy blocks the Ubuntu apt mirrors. Build on the
+    # hosted image, deploy from the self-hosted pool.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare_account_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (fleet pin)
+
+      - name: Install Rust (the runner image has no toolchain)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Kernel git credential helper (FLEET_TOKEN, never logged)
+        if: env.FLEET_TOKEN != ''
+        run: git config --global credential.helper '!f() { echo username=x-access-token; echo password="${FLEET_TOKEN}"; }; f'
+
+      - name: Build static export
+        run: ${{ inputs.build_command }}
+
+      - name: Validate Worker bundle (no upload)
+        run: npx --yes wrangler@4.162.0 deploy --dry-run --config ${{ inputs.config_path }}
+
+      - name: Upload static export
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ inputs.service }}-dist
+          path: ${{ inputs.assets_dir }}
+          if-no-files-found: error
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: [self-hosted, palupgg-ci]
+    timeout-minutes: 15
+    environment: ${{ inputs.environment }}
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare_account_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (fleet pin)
+
+      - name: Download static export
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.service }}-dist
+          path: ${{ inputs.assets_dir }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Deploy Worker
+        run: npx --yes wrangler@4.162.0 deploy --config ${{ inputs.config_path }} --name ${{ inputs.worker_name }}
