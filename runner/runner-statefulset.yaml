@@ -27,11 +27,11 @@ spec:
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
-        # The runner image's own user: config.User=runner, APP_UID=1654.
-        # 1000 cannot read /home/runner and config.sh fails with permission denied.
-        runAsUser: 1654
-        runAsGroup: 1654
-        fsGroup: 1654
+        # The runner image's real user: runner:x:1001:1001. /home/runner is
+        # 0750 runner:docker, so only uid 1001 can read config.sh.
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
       containers:
         - name: runner
           image: ghcr.io/actions/actions-runner:2.327.1
