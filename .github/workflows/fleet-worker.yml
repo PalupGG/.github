@@ -46,8 +46,8 @@ on:
         description: Read token for the private kernel dependency.
         required: false
       CLOUDFLARE_API_TOKEN:
-        description: Workers Scripts Edit token.
-        required: true
+        description: Workers Scripts Edit token (required for deploy, optional for PR build).
+        required: false
 
 permissions:
   contents: read
