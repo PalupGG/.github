@@ -34,7 +34,7 @@ spec:
         fsGroup: 1001
       containers:
         - name: runner
-          image: ghcr.io/actions/actions-runner:2.327.1
+          image: ghcr.io/actions/actions-runner:2.338.2 # GitHub requires >= 2.329.0 to register
           env:
             - name: RUNNER_ALLOW_RUNASROOT
               value: "false"
