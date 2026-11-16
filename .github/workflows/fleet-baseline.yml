@@ -1,0 +1,230 @@
+name: fleet-baseline
+
+# Baseline deployment for ADR-PLT-0028: one record, one orchestrator,
+# per-component executors. The caller is `PalupGG/gitops`; the record it reads is
+# `releases/<environment>.yaml` in that repository.
+#
+#   plan   — read the record, decide per component (deploy desired | rollback to a
+#            ref or to `previous`), order from releases/baseline-order.yaml
+#   apply  — dispatch each component's executor sequentially, fail-fast, collect
+#            the child run and its Worker version
+#   record — write observed/previous back and commit; on a tag, publish the release
+#
+# Rollback is a first-class mode, not a script: it prefers the recorded Worker
+# version (a version-id restore, seconds, no rebuild and no artifact) and only
+# falls back to a digest-pinned promote.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "proto | test | prod"
+        required: true
+        type: string
+      mode:
+        description: "deploy | rollback"
+        required: true
+        type: string
+      baseline_ref:
+        description: "git ref of the record to read (default: the checked-out ref)"
+        required: false
+        type: string
+        default: ""
+      rollback_to_ref:
+        description: "mode=rollback: restore the record as it stood at this ref"
+        required: false
+        type: string
+        default: ""
+      components:
+        description: "changed | all | comma-separated names"
+        required: false
+        type: string
+        default: "changed"
+      dry_run:
+        description: "print the dispatch table and change nothing"
+        required: false
+        type: boolean
+        default: true
+      reason:
+        description: "why this promotion happened (recorded in the run and the release)"
+        required: false
+        type: string
+        default: ""
+      tools_ref:
+        description: "ref of PalupGG/.github to take scripts/baseline.py from (pin it like the caller pins this workflow)"
+        required: false
+        type: string
+        default: "main"
+    secrets:
+      BASELINE_TOKEN:
+        description: "actions:write on component repos + contents:write on gitops; never a developer token"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.plan.outputs.go }}
+      env: ${{ steps.plan.outputs.env }}
+    steps:
+      - name: Only a founder reaches prod
+        # No environment protection rules on this plan (API 422), so the gate is
+        # an actor allowlist — stated, not implied (ADR-PLT-0025 §13).
+        if: inputs.environment == 'prod'
+        run: |
+          set -euo pipefail
+          case "${{ github.actor }}" in
+            Pikachuz42|zymcs) echo "actor ${{ github.actor }} allowed" ;;
+            *) echo "refusing: ${{ github.actor }} is not a release owner"; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: PalupGG/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .tools
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - run: python -m pip install --quiet pyyaml
+
+      - name: Plan the baseline
+        id: plan
+        env:
+          ENV: ${{ inputs.environment }}
+          MODE: ${{ inputs.mode }}
+          COMPONENTS: ${{ inputs.components }}
+          ROLLBACK_TO: ${{ inputs.rollback_to_ref }}
+          DRY: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          args=(plan --env "$ENV" --mode "$MODE" --file "releases/$ENV.yaml" --components "$COMPONENTS")
+          [ -n "$ROLLBACK_TO" ] && args+=(--to-ref "$ROLLBACK_TO")
+          [ "$DRY" = "true" ] && args+=(--dry-run)
+          python .tools/scripts/baseline.py "${args[@]}" | tee plan.json
+          count=$(python -c 'import json;print(len(json.load(open("plan.json"))["components"]))')
+          echo "env=$ENV" >> "$GITHUB_OUTPUT"
+          if [ "$count" -gt 0 ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            echo "nothing to do for $ENV" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: baseline-plan
+          path: plan.json
+          retention-days: 30
+
+  apply:
+    needs: plan
+    if: needs.plan.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: baseline-plan
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: PalupGG/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .tools
+
+      - name: Dispatch the executors
+        env:
+          BASELINE_TOKEN: ${{ secrets.BASELINE_TOKEN }}
+          WAIT_SECONDS: "1800"
+        run: |
+          set -euo pipefail
+          if [ -z "${BASELINE_TOKEN:-}" ]; then
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo "dry-run: no credential needed"
+            else
+              echo "refusing: BASELINE_TOKEN is not configured — no deploy without it"
+              exit 2
+            fi
+          fi
+          python .tools/scripts/baseline.py apply --plan plan.json --results results.json
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: baseline-results
+          path: results.json
+          retention-days: 90
+          if-no-files-found: warn
+
+  record:
+    needs: [plan, apply]
+    if: always() && needs.apply.result == 'success' && needs.plan.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: baseline-*
+          path: artifacts
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: PalupGG/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .tools
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - run: python -m pip install --quiet pyyaml
+
+      - name: Write the record
+        if: inputs.dry_run == false
+        env:
+          RECORDED_BY: ${{ github.actor }}
+          ENV: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          python .tools/scripts/baseline.py record \
+            --file "releases/$ENV.yaml" \
+            --results artifacts/baseline-results/results.json
+          if [ -z "$(git status --porcelain releases/)" ]; then
+            echo "record unchanged"
+            exit 0
+          fi
+          git config user.name "palupgg-bot"
+          git config user.email "bot@palupgg.invalid"
+          git add releases/
+          git commit -m "record($ENV): ${{ inputs.mode }} — ${{ inputs.reason || 'baseline promotion' }}"
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+      - name: Publish the release
+        if: github.ref_type == 'tag' && inputs.dry_run == false
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python .tools/scripts/baseline.py notes \
+            --plan artifacts/baseline-plan/plan.json \
+            --results artifacts/baseline-results/results.json \
+            --out notes.md
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --notes-file notes.md \
+            --verify-tag
