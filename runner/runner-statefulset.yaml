@@ -27,12 +27,14 @@ spec:
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
-        runAsUser: 1000
-        runAsGroup: 1000
-        fsGroup: 1000
+        # The runner image's real user: runner:x:1001:1001. /home/runner is
+        # 0750 runner:docker, so only uid 1001 can read config.sh.
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
       containers:
         - name: runner
-          image: ghcr.io/actions/actions-runner:2.327.1
+          image: ghcr.io/actions/actions-runner:2.338.2 # GitHub requires >= 2.329.0 to register
           env:
             - name: RUNNER_ALLOW_RUNASROOT
               value: "false"
@@ -66,4 +68,7 @@ spec:
     - metadata: { name: data }
       spec:
         accessModes: ["ReadWriteOnce"]
+        # The cluster's only StorageClass; it carries no default annotation, so the
+        # claim must name it or the pod stays Pending on an unbound PVC.
+        storageClassName: local-path
         resources: { requests: { storage: 20Gi } }
