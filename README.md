@@ -36,6 +36,16 @@ a `postgres:17-alpine` service (dummy job-local password, `pg_isready` health ga
 `<CONNECTION_ENV_VAR>` set to `postgres://postgres:<password>@localhost:5432/<postgres-database>`
 (`postgres-database` defaults to `test`).
 
+A Rust Worker repository opts in with `with: { worker-tests: true }`. Its tests boot
+`wrangler dev`, whose build command is `worker-build` (workers-rs), and neither that binary nor
+the `wasm32-unknown-unknown` target is part of the pinned Rust toolchain — without both, the
+suite fails at the build command, not at an assertion. The opt-in adds the target and a
+version-pinned `worker-build` (0.9.0) to both gate jobs, and adds a `worker-smoke` job that
+proves the environment independently of any service: a throwaway Worker must answer `/healthz`
+and echo one WebSocket message. Trade-off: a cold `cargo install worker-build` costs a few
+minutes; a pre-baked runner image would be faster but would move the toolchain version out of
+this repository and into the cluster.
+
 The SHA is bumped deliberately, in a PR, when the workflow changes — never a branch, never
 a floating tag.
 
