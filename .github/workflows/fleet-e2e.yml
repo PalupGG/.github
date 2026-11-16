@@ -9,9 +9,13 @@ on:
   workflow_call:
     inputs:
       runs-on:
-        description: "Runner label — ubuntu-latest until the org runner pool exists, then the self-hosted label"
+        description: 'JSON array of runner labels for the plain e2e job, e.g. ["ubuntu-latest"] or ["self-hosted","palupgg-build"]'
         type: string
-        default: "ubuntu-latest"
+        default: '["ubuntu-latest"]'
+      postgres-runs-on:
+        description: 'JSON array of runner labels for the Postgres twin (needs Docker), e.g. ["ubuntu-latest"]'
+        type: string
+        default: '["ubuntu-latest"]'
       postgres:
         description: "Run the e2e beside a postgres:17-alpine service and point postgres-env at it"
         type: boolean
@@ -51,7 +55,7 @@ concurrency:
 jobs:
   e2e:
     if: inputs.postgres == false
-    runs-on: ${{ inputs.runs-on }}
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 45
     env:
       FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
@@ -69,7 +73,7 @@ jobs:
           rustup show
 
       - name: Cache cargo (hosted runners)
-        if: inputs.runs-on == 'ubuntu-latest'
+        if: contains(inputs.runs-on, 'ubuntu-latest')
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Kernel git credential helper (FLEET_TOKEN, never logged)
@@ -120,7 +124,7 @@ jobs:
     # so the opt-in is this twin of `e2e`, skipped unless postgres is true. Keep the steps
     # in lockstep with `e2e` above.
     if: inputs.postgres == true
-    runs-on: ${{ inputs.runs-on }}
+    runs-on: ${{ fromJSON(inputs.postgres-runs-on) }}
     timeout-minutes: 45
     env:
       FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
@@ -155,7 +159,7 @@ jobs:
           rustup show
 
       - name: Cache cargo (hosted runners)
-        if: inputs.runs-on == 'ubuntu-latest'
+        if: contains(inputs.postgres-runs-on, 'ubuntu-latest')
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Kernel git credential helper (FLEET_TOKEN, never logged)
