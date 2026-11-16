@@ -1,0 +1,257 @@
+name: fleet-worker-promote
+
+# Build once, promote the artifact (ADR-PLT-0025 revision 2).
+#
+# Three modes, one ladder:
+#   build    — build the assets, compute the digest, upload a Worker Version to <worker_name>
+#   promote  — take the artifact from a previous build run, verify the digest, upload a
+#              Version to a different <worker_name> (same bytes, new script)
+#   rollback — point <worker_name> back at a previously recorded Version
+#
+# Cloudflare Worker Versions are scoped to one script, so a version id cannot cross
+# Workers; the digest of the artifact is the identity that travels. That is why `promote`
+# re-downloads the build artifact instead of rebuilding.
+#
+# Ownership unchanged: wrangler owns the script/version, Terraform Cloud owns DNS, WAF and
+# the custom domain.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: Service name used for the artifact name.
+        required: true
+        type: string
+      worker_name:
+        description: Cloudflare Worker to deploy or roll back.
+        required: true
+        type: string
+      config_path:
+        description: Path to the Wrangler config.
+        required: true
+        type: string
+      assets_dir:
+        description: Directory containing the built static assets.
+        required: true
+        type: string
+      build_command:
+        description: Command that produces the static assets (mode=build only).
+        required: false
+        type: string
+        default: ""
+      cloudflare_account_id:
+        description: Cloudflare account ID.
+        required: true
+        type: string
+      environment:
+        description: GitHub environment (proto, test or prod).
+        required: true
+        type: string
+      mode:
+        description: 'build | promote | rollback'
+        required: true
+        type: string
+      source_run_id:
+        description: Run id of the build whose artifact is promoted (mode=promote).
+        required: false
+        type: string
+        default: ""
+      expected_digest:
+        description: Digest the artifact must have before promotion (mode=promote).
+        required: false
+        type: string
+        default: ""
+      version_id:
+        description: Worker Version to restore (mode=rollback).
+        required: false
+        type: string
+        default: ""
+      base_url:
+        description: Optional URL to smoke-test after the deploy.
+        required: false
+        type: string
+        default: ""
+      build_runner:
+        description: 'JSON array of runner labels for the build job.'
+        required: false
+        type: string
+        default: '["ubuntu-latest"]'
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        description: Workers Scripts Edit token.
+        required: true
+      FLEET_TOKEN:
+        description: Read token for the private kernel dependency.
+        required: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    if: inputs.mode == 'build'
+    runs-on: ${{ fromJSON(inputs.build_runner) }}
+    timeout-minutes: 30
+    outputs:
+      digest: ${{ steps.digest.outputs.value }}
+    env:
+      FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare_account_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (fleet pin)
+
+      - name: Install Rust (hosted runners have no toolchain)
+        if: contains(inputs.build_runner, 'ubuntu-latest')
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Kernel git credential helper (FLEET_TOKEN, never logged)
+        if: env.FLEET_TOKEN != ''
+        run: git config --global credential.helper '!f() { echo username=x-access-token; echo password="${FLEET_TOKEN}"; }; f'
+
+      - name: Build static export
+        run: ${{ inputs.build_command }}
+
+      - name: Validate Worker bundle (no upload)
+        run: npx --yes wrangler@4.162.0 deploy --dry-run --config ${{ inputs.config_path }}
+
+      - name: Compute artifact digest
+        id: digest
+        run: |
+          set -euo pipefail
+          value=$(cd "${{ inputs.assets_dir }}" && find . -type f | sort | xargs sha256sum | sha256sum | cut -d' ' -f1)
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+          echo "digest=$value" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload static export
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ inputs.service }}-dist
+          path: ${{ inputs.assets_dir }}
+          if-no-files-found: error
+          retention-days: 90
+
+  release:
+    # Runs for build (fresh artifact) and promote (artifact from another run).
+    if: ${{ !cancelled() && (inputs.mode == 'build' || inputs.mode == 'promote') }}
+    needs: [build]
+    runs-on: [self-hosted, palupgg-ci]
+    timeout-minutes: 20
+    environment: ${{ inputs.environment }}
+    concurrency: worker-${{ inputs.worker_name }}
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare_account_id }}
+      WORKER: ${{ inputs.worker_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (fleet pin)
+
+      - name: Download the built artifact from this run
+        if: inputs.mode == 'build'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.service }}-dist
+          path: ${{ inputs.assets_dir }}
+
+      - name: Download the built artifact from the build run (no rebuild)
+        if: inputs.mode == 'promote'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.service }}-dist
+          path: ${{ inputs.assets_dir }}
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Verify the promoted artifact is the tested one
+        if: inputs.mode == 'promote'
+        run: |
+          set -euo pipefail
+          actual=$(cd "${{ inputs.assets_dir }}" && find . -type f | sort | xargs sha256sum | sha256sum | cut -d' ' -f1)
+          expected="${{ inputs.expected_digest }}"
+          echo "expected=$expected"
+          echo "actual=$actual"
+          if [ -z "$expected" ]; then echo "expected_digest is required for promote"; exit 1; fi
+          if [ "$actual" != "$expected" ]; then echo "digest mismatch: the build being promoted is not the one that was verified"; exit 1; fi
+
+      - name: Upload Worker Version
+        id: upload
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@4.162.0 versions upload \
+            --config "${{ inputs.config_path }}" \
+            --name "$WORKER" \
+            --tag "$GITHUB_SHA" \
+            --message "${{ inputs.mode }} $GITHUB_SHA" | tee /tmp/upload.log
+          version=$(grep -oiE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' /tmp/upload.log | head -1)
+          if [ -z "$version" ]; then echo "could not read the Version ID from wrangler output"; exit 1; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "| worker | version | commit | digest |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| $WORKER | $version | $GITHUB_SHA | ${{ inputs.expected_digest || needs.build.outputs.digest }} |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy that Version
+        run: npx --yes wrangler@4.162.0 versions deploy "${{ steps.upload.outputs.version }}@100%" --name "$WORKER"
+
+      - name: Record what is live
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@4.162.0 deployments status --name "$WORKER" | tee /tmp/status.log
+          echo "### live on ${{ inputs.environment }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -20 /tmp/status.log >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Smoke test
+        if: inputs.base_url != ''
+        env:
+          BASE: ${{ inputs.base_url }}
+        run: |
+          set -euo pipefail
+          code=$(curl -sS -o /tmp/healthz -w '%{http_code}' --max-time 20 "$BASE/healthz" || true)
+          body=$(cat /tmp/healthz 2>/dev/null || true)
+          echo "GET $BASE/healthz -> $code $body"
+          if [ "$code" = "403" ]; then
+            echo "::warning::403 — this runner's egress is not in the Cloudflare allowlist; verify from an allowlisted host"
+            exit 0
+          fi
+          [ "$code" = "200" ] && [ "$body" = "ok" ]
+
+  rollback:
+    if: inputs.mode == 'rollback'
+    runs-on: [self-hosted, palupgg-ci]
+    timeout-minutes: 15
+    environment: ${{ inputs.environment }}
+    concurrency: worker-${{ inputs.worker_name }}
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare_account_id }}
+      WORKER: ${{ inputs.worker_name }}
+      VERSION: ${{ inputs.version_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (fleet pin)
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Show the deployment history being rolled back from
+        run: npx --yes wrangler@4.162.0 deployments list --name "$WORKER" | tee /tmp/history.log
+
+      - name: Roll back
+        run: |
+          set -euo pipefail
+          if [ -z "$VERSION" ]; then echo "version_id is required for rollback"; exit 1; fi
+          npx --yes wrangler@4.162.0 rollback "$VERSION" --name "$WORKER"
+
+      - name: Confirm
+        run: npx --yes wrangler@4.162.0 deployments status --name "$WORKER" | tee -a "$GITHUB_STEP_SUMMARY"
