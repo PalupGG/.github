@@ -8,9 +8,9 @@ on:
         type: boolean
         default: false
       runs-on:
-        description: "Runner label — ubuntu-latest until the org runner pool exists, then the self-hosted label"
+        description: 'JSON array of runner labels, e.g. ["ubuntu-latest"] or ["self-hosted","palupgg-build"]'
         type: string
-        default: "ubuntu-latest"
+        default: '["ubuntu-latest"]'
       postgres:
         description: "Run the gates beside a postgres:17-alpine service for database-backed suites"
         type: boolean
@@ -38,7 +38,7 @@ concurrency:
 jobs:
   gates:
     if: inputs.postgres == false
-    runs-on: ${{ inputs.runs-on }}
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 45
     env:
       FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
@@ -53,7 +53,7 @@ jobs:
           rustup show
 
       - name: Cache cargo (hosted runners)
-        if: inputs.runs-on == 'ubuntu-latest'
+        if: contains(inputs.runs-on, 'ubuntu-latest')
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Kernel git credential helper (FLEET_TOKEN, never logged)
@@ -85,7 +85,7 @@ jobs:
     # so the opt-in is this twin of `gates`, skipped unless postgres is true. Keep the gate
     # steps in lockstep with `gates` above.
     if: inputs.postgres == true
-    runs-on: ${{ inputs.runs-on }}
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 45
     env:
       FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
@@ -117,7 +117,7 @@ jobs:
           rustup show
 
       - name: Cache cargo (hosted runners)
-        if: inputs.runs-on == 'ubuntu-latest'
+        if: contains(inputs.runs-on, 'ubuntu-latest')
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Kernel git credential helper (FLEET_TOKEN, never logged)

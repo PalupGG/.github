@@ -41,6 +41,11 @@ on:
         description: Cloudflare account ID.
         required: true
         type: string
+      build_runner:
+        description: 'JSON array of runner labels for the build job, e.g. ["ubuntu-latest"] or ["self-hosted","palupgg-build"]'
+        required: false
+        type: string
+        default: '["ubuntu-latest"]'
     secrets:
       FLEET_TOKEN:
         description: Read token for the private kernel dependency.
@@ -54,10 +59,9 @@ permissions:
 
 jobs:
   build:
-    # The Rust build needs a C linker; the minimal self-hosted runner image has
-    # none and its egress policy blocks the Ubuntu apt mirrors. Build on the
-    # hosted image, deploy from the self-hosted pool.
-    runs-on: ubuntu-latest
+    # Hosted by default; a repository with a runner that has a C linker and the
+    # Rust/Node toolchain (the Minisforum `palupgg-build`) passes its labels.
+    runs-on: ${{ fromJSON(inputs.build_runner) }}
     timeout-minutes: 30
     env:
       FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
@@ -65,7 +69,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (fleet pin)
 
-      - name: Install Rust (the runner image has no toolchain)
+      - name: Install Rust (hosted runners have no toolchain)
+        if: contains(inputs.build_runner, 'ubuntu-latest')
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
