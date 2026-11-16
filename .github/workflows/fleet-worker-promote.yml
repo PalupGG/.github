@@ -103,6 +103,7 @@ jobs:
     env:
       FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare_account_id }}
+      SERVICE: ${{ inputs.service }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (fleet pin)
 
@@ -126,20 +127,25 @@ jobs:
       - name: Validate Worker bundle (no upload)
         run: npx --yes wrangler@4.162.0 deploy --dry-run --config ${{ inputs.config_path }}
 
-      - name: Compute artifact digest
+      - name: Pack and digest the artifact
         id: digest
         run: |
           set -euo pipefail
-          value=$(cd "${{ inputs.assets_dir }}" && find . -type f | sort | xargs sha256sum | sha256sum | cut -d' ' -f1)
+          # Hash the artifact itself, not the directory: upload/download can drop files
+          # (hidden files, ignore rules), and a digest over a directory then describes
+          # something other than what travels.
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -cf "$RUNNER_TEMP/${SERVICE}-dist.tar" -C "${{ inputs.assets_dir }}" .
+          value=$(sha256sum "$RUNNER_TEMP/${SERVICE}-dist.tar" | cut -d' ' -f1)
           echo "value=$value" >> "$GITHUB_OUTPUT"
           echo "artifact digest: $value"
           echo "digest=$value" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload static export
+      - name: Upload the artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ inputs.service }}-dist
-          path: ${{ inputs.assets_dir }}
+          path: ${{ runner.temp }}/${{ inputs.service }}-dist.tar
           if-no-files-found: error
           retention-days: 90
 
@@ -165,14 +171,14 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ${{ inputs.service }}-dist
-          path: ${{ inputs.assets_dir }}
+          path: ${{ runner.temp }}/artifact
 
       - name: Download the built artifact from the build run (no rebuild)
         if: inputs.mode == 'promote'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ${{ inputs.service }}-dist
-          path: ${{ inputs.assets_dir }}
+          path: ${{ runner.temp }}/artifact
           run-id: ${{ inputs.source_run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -180,16 +186,20 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Verify the promoted artifact is the tested one
-        if: inputs.mode == 'promote'
+      - name: Verify the artifact and unpack it
         run: |
           set -euo pipefail
-          actual=$(cd "${{ inputs.assets_dir }}" && find . -type f | sort | xargs sha256sum | sha256sum | cut -d' ' -f1)
-          expected="${{ inputs.expected_digest }}"
+          tarfile="$RUNNER_TEMP/artifact/${{ inputs.service }}-dist.tar"
+          [ -f "$tarfile" ] || { echo "artifact tar missing at $tarfile"; exit 1; }
+          actual=$(sha256sum "$tarfile" | cut -d' ' -f1)
+          expected="${{ inputs.expected_digest || needs.build.outputs.digest }}"
           echo "expected=$expected"
           echo "actual=$actual"
-          if [ -z "$expected" ]; then echo "expected_digest is required for promote"; exit 1; fi
-          if [ "$actual" != "$expected" ]; then echo "digest mismatch: the build being promoted is not the one that was verified"; exit 1; fi
+          if [ -z "$expected" ]; then echo "no expected digest (promote needs expected_digest)"; exit 1; fi
+          if [ "$actual" != "$expected" ]; then echo "digest mismatch: this artifact is not the one that was verified"; exit 1; fi
+          rm -rf "${{ inputs.assets_dir }}"
+          mkdir -p "${{ inputs.assets_dir }}"
+          tar -xf "$tarfile" -C "${{ inputs.assets_dir }}"
 
       - name: Upload Worker Version
         id: upload
