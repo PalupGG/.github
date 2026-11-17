@@ -27,6 +27,10 @@ on:
         description: "Database the service creates and the URL points at (when postgres is true)"
         type: string
         default: "test"
+      worker-tests:
+        description: "Provision the Rust Worker test toolchain (wasm32 target + worker-build) and prove workerd boots before the gates"
+        type: boolean
+        default: false
     secrets:
       FLEET_TOKEN:
         description: "Read-only token that can fetch SanctuaryGG/kernel (not needed in the kernel repository itself)"
@@ -56,6 +60,17 @@ jobs:
           rustup set profile minimal
           rustup show
 
+      # A Rust Worker's tests boot `wrangler dev`, whose build command is
+      # `worker-build` (workers-rs). Neither the wasm target nor that binary is
+      # part of the pinned Rust toolchain, so the suite fails at the build command
+      # instead of at an assertion. worker-build is version-pinned here: it is a
+      # toolchain, and an unpinned toolchain makes a green unreproducible.
+      - name: Worker test toolchain (wasm32 + worker-build)
+        if: inputs.worker-tests
+        run: |
+          rustup target add wasm32-unknown-unknown
+          command -v worker-build >/dev/null 2>&1 || cargo install worker-build --version 0.9.0 --locked
+
       - name: Cache cargo (hosted runners)
         if: contains(inputs.runs-on, 'ubuntu-latest')
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -83,6 +98,58 @@ jobs:
 
       - name: Gate — tests
         run: cargo test
+
+  worker-smoke:
+    # The environment proof, independent of any service: a throwaway JS Worker must
+    # answer /healthz and echo one WebSocket message under `wrangler dev`. A service
+    # suite failing then tells you the *service* is red only after this job is green.
+    if: inputs.worker-tests
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Boot a throwaway Worker under workerd
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/worker-smoke"
+          mkdir -p "$d/src"
+          printf '%s\n' '{ "name": "worker-smoke", "main": "src/index.js", "compatibility_date": "2026-11-01" }' > "$d/wrangler.jsonc"
+          cat > "$d/src/index.js" <<'JS'
+          export default {
+            async fetch(request) {
+              const url = new URL(request.url);
+              if (url.pathname === "/healthz") return new Response("ok");
+              if (url.pathname === "/ws") {
+                const pair = new WebSocketPair();
+                const [client, server] = Object.values(pair);
+                server.accept();
+                server.addEventListener("message", (event) => server.send(`echo:${event.data}`));
+                return new Response(null, { status: 101, webSocket: client });
+              }
+              return new Response("not found", { status: 404 });
+            },
+          };
+          JS
+          cd "$d"
+          npx --yes wrangler@4.163.0 dev --port 8787 --ip 127.0.0.1 > "$RUNNER_TEMP/wrangler-smoke.log" 2>&1 &
+          for _ in $(seq 1 120); do
+            if [ "$(curl -fsS http://127.0.0.1:8787/healthz 2>/dev/null || true)" = "ok" ]; then break; fi
+            sleep 1
+          done
+          test "$(curl -fsS http://127.0.0.1:8787/healthz)" = "ok"
+          node -e '
+          const ws = new WebSocket("ws://127.0.0.1:8787/ws");
+          const timer = setTimeout(() => { console.error("no echo within 10s"); process.exit(1); }, 10000);
+          ws.onopen = () => ws.send("ping");
+          ws.onmessage = (event) => { clearTimeout(timer); console.log(event.data); process.exit(event.data === "echo:ping" ? 0 : 1); };
+          '
+
+      - name: wrangler log on failure
+        if: failure()
+        run: cat "$RUNNER_TEMP/wrangler-smoke.log" || true
 
   gates-postgres:
     # The postgres opt-in. GitHub Actions has no conditional `services:` (actions/runner#822),
@@ -119,6 +186,12 @@ jobs:
         run: |
           rustup set profile minimal
           rustup show
+
+      - name: Worker test toolchain (wasm32 + worker-build)
+        if: inputs.worker-tests
+        run: |
+          rustup target add wasm32-unknown-unknown
+          command -v worker-build >/dev/null 2>&1 || cargo install worker-build --version 0.9.0 --locked
 
       - name: Cache cargo (hosted runners)
         if: contains(inputs.postgres-runs-on, 'ubuntu-latest')
