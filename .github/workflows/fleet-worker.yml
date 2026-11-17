@@ -102,6 +102,8 @@ jobs:
     runs-on: [self-hosted, palupgg-ci]
     timeout-minutes: 15
     environment: ${{ inputs.environment }}
+    outputs:
+      deploy_url: ${{ steps.deploy.outputs.deploy_url }}
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare_account_id }}
@@ -119,4 +121,56 @@ jobs:
           node-version: "22"
 
       - name: Deploy Worker
-        run: npx --yes wrangler@4.162.0 deploy --config ${{ inputs.config_path }} --name ${{ inputs.worker_name }}
+        id: deploy
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@4.162.0 deploy --config "${{ inputs.config_path }}" --name "${{ inputs.worker_name }}" 2>&1 | tee /tmp/deploy.log
+          # First https://*.workers.dev URL the deploy printed. Empty when wrangler
+          # published no workers.dev target (custom-domain-only Worker, or the
+          # "No targets deployed" case) — the smoke step then skips explicitly.
+          url=$(grep -oE 'https://[^[:space:]]+\.workers\.dev' /tmp/deploy.log | head -1 || true)
+          echo "deploy_url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke the deployed URL
+        env:
+          DEPLOY_URL: ${{ steps.deploy.outputs.deploy_url }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DEPLOY_URL" ]; then
+            echo "::notice::no workers.dev URL in the deploy output — nothing was published to smoke (custom-domain-only Worker or no targets deployed); smoke skipped"
+            exit 0
+          fi
+          fail=0
+
+          code=$(curl -sS -o /tmp/smoke-healthz.body -D /tmp/smoke-healthz.hdr -w '%{http_code}' --max-time 20 "$DEPLOY_URL/healthz")
+          healthz_body=$(cat /tmp/smoke-healthz.body)
+          echo "GET $DEPLOY_URL/healthz -> $code $healthz_body"
+          [ "$code" = "200" ] || { echo "::error::/healthz status $code, expected 200"; fail=1; }
+          [ "$healthz_body" = "ok" ] || { echo "::error::/healthz body '$healthz_body', expected 'ok'"; fail=1; }
+
+          code=$(curl -sS -o /tmp/smoke-root.body -D /tmp/smoke-root.hdr -w '%{http_code}' --max-time 20 "$DEPLOY_URL/")
+          echo "GET $DEPLOY_URL/ -> $code"
+          [ "$code" = "200" ] || { echo "::error::/ status $code, expected 200"; fail=1; }
+
+          # Security headers asserted on both responses.
+          for pair in "healthz /tmp/smoke-healthz.hdr" "root /tmp/smoke-root.hdr"; do
+            set -- $pair
+            label=$1; hdr=$2
+            for check in "x-content-type-options nosniff" "content-security-policy" "referrer-policy"; do
+              set -- $check
+              header=$1; want=${2:-}
+              if grep -qiE "^$header:[[:space:]]*$want" "$hdr"; then
+                echo "smoke $label: $header present"
+              else
+                echo "::error::$label: missing or wrong $header (want: ${want:-any value})"
+                grep -i "^$header" "$hdr" || echo "  (header absent)"
+                fail=1
+              fi
+            done
+          done
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::smoke failed for $DEPLOY_URL — the deployed Worker does not meet the contract"
+            exit 1
+          fi
+          echo "smoke passed: $DEPLOY_URL answered healthz=ok, / 200, with the three security headers"
