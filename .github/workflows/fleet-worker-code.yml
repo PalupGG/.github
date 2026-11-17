@@ -225,8 +225,9 @@ jobs:
   release:
     # Runs for build (fresh artifact) and promote (artifact from another run, never rebuilt).
     # This is the only job that publishes, so it is where the config invariants and the
-    # D1 resolution live.
-    if: ${{ !cancelled() && (inputs.mode == 'build' || inputs.mode == 'promote') }}
+    # D1 resolution live. `needs.validate.result == 'success'` makes a red validate skip
+    # this job up front instead of surfacing later at artifact verify on a pool runner.
+    if: ${{ !cancelled() && needs.validate.result == 'success' && (inputs.mode == 'build' || inputs.mode == 'promote') }}
     needs: [validate, build]
     runs-on: [self-hosted, palupgg-ci]
     timeout-minutes: 20
@@ -343,22 +344,6 @@ jobs:
           D1: ${{ inputs.d1_database }}
         run: npx --yes wrangler@4.162.0 d1 migrations apply "$D1" --remote --config "$CONFIG"
 
-      - name: Restore the placeholder database_id (never a real id in any tree)
-        if: ${{ always() && inputs.d1_database != '' }}
-        env:
-          PLACEHOLDER: ${{ inputs.d1_placeholder }}
-        run: |
-          set -euo pipefail
-          if [ ! -f "$RUNNER_TEMP/config.pristine" ]; then
-            echo "no pristine copy — the patch step never ran, nothing to restore"
-            exit 0
-          fi
-          cp "$RUNNER_TEMP/config.pristine" "$CONFIG"
-          grep -q "\"database_id\": \"$PLACEHOLDER\"" "$CONFIG" || {
-            echo "::error::placeholder restore verification failed"; exit 1
-          }
-          echo "config restored: the tree keeps the placeholder, the real id lived only inside this job"
-
       - name: Upload Worker Version
         id: upload
         run: |
@@ -374,6 +359,26 @@ jobs:
           echo "| worker | version | commit | digest |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
           echo "| $WORKER | $version | $GITHUB_SHA | ${{ inputs.expected_digest || needs.build.outputs.digest }} |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore the placeholder database_id (never a real id in any tree)
+        # Runs after the upload because `versions upload --config` is the step that
+        # bakes the D1 binding into the Version — it must read the patched config.
+        # "Deploy that Version" and later steps read `--name` only, so restoring
+        # before them is safe. always(): a failed upload still restores the tree.
+        if: ${{ always() && inputs.d1_database != '' }}
+        env:
+          PLACEHOLDER: ${{ inputs.d1_placeholder }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$RUNNER_TEMP/config.pristine" ]; then
+            echo "no pristine copy — the patch step never ran, nothing to restore"
+            exit 0
+          fi
+          cp "$RUNNER_TEMP/config.pristine" "$CONFIG"
+          grep -q "\"database_id\": \"$PLACEHOLDER\"" "$CONFIG" || {
+            echo "::error::placeholder restore verification failed"; exit 1
+          }
+          echo "config restored: the tree keeps the placeholder, the real id lived only inside this job"
 
       - name: Deploy that Version
         run: npx --yes wrangler@4.162.0 versions deploy "${{ steps.upload.outputs.version }}@100%" --name "$WORKER"
