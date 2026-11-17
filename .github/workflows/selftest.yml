@@ -12,9 +12,13 @@ jobs:
   compose-check:
     # Calls the reusable workflow; jobs failing at the boundary-gate step (this repo
     # has no scripts/) proves composition works.
+    # runs-on is fleet-ci's JSON-array input: a bare label makes fromJSON() throw at
+    # job setup, and the vanished job silently guts the proof (every main selftest
+    # run before 2026-11-17 lacked "compose-check / gates" — jobs API, check-runs
+    # and UI all agreed it was never created).
     uses: PalupGG/.github/.github/workflows/fleet-ci.yml@main
     with:
-      runs-on: ubuntu-latest
+      runs-on: '["ubuntu-latest"]'
   image-compose-check:
     # Same proof for fleet-image: the job must START and fail at a real step (no
     # Cargo.toml in this repo) — that is composition proven, not a broken callee.
@@ -32,3 +36,104 @@ jobs:
       contents: write # reusable workflows cannot elevate: the caller must grant what the callee needs
     with:
       runs-on: ubuntu-latest
+  postgres-fixture:
+    # Issue #36 fixture caller on the Postgres rail: `gates` must be SKIPPED and
+    # `gates-postgres` must RUN (it fails at the boundary gate here — no scripts/ —
+    # which is composition proven, same convention as compose-check above).
+    uses: PalupGG/.github/.github/workflows/fleet-ci.yml@main
+    with:
+      postgres: true
+  worker-fixture:
+    # Issue #36 fixture caller on the Worker rail (chat's shape): `gates` and
+    # `worker-smoke` must RUN, `gates-postgres` must be SKIPPED. `worker-smoke`
+    # is environment-only, so it can go green inside this repo.
+    uses: PalupGG/.github/.github/workflows/fleet-ci.yml@main
+    with:
+      worker-tests: true
+  edge-smoke-pass:
+    # The positive edge smoke against the org's real deployed edge: web's gated
+    # hostname (proto) serves the only public deployed /healthz (chat is
+    # binding-only, no hostname of its own). Best-effort by contract: a 403 from
+    # a runner egress the WAF does not allowlist, or a blip, warns and continues.
+    uses: PalupGG/.github/.github/workflows/fleet-ci.yml@main
+    with:
+      edge-smoke-url: https://proto.palup.gg/healthz
+      edge-smoke-version: ok
+  edge-smoke-wrong-url:
+    # Negative (issue #36: a wrong URL fails): example.com/healthz answers 404,
+    # so the smoke must fail — proving it is not vacuously green.
+    uses: PalupGG/.github/.github/workflows/fleet-ci.yml@main
+    with:
+      edge-smoke-url: https://example.com/healthz
+      edge-smoke-version: ok
+  edge-smoke-stale-version:
+    # Negative (issue #36: a stale version fails): example.com/ answers 200 with
+    # an HTML body that does not contain the expected marker.
+    uses: PalupGG/.github/.github/workflows/fleet-ci.yml@main
+    with:
+      edge-smoke-url: https://example.com/
+      edge-smoke-version: palupgg-selftest-expected-version-marker
+  edge-smoke-no-answer:
+    # Blip tolerance: a host that cannot answer (NXDOMAIN lands on the 000 path)
+    # must NOT fail the leg — timeout + continue, per the edge smoke contract.
+    uses: PalupGG/.github/.github/workflows/fleet-ci.yml@main
+    with:
+      edge-smoke-url: https://palupgg-selftest-no-such-host.invalid/healthz
+      edge-smoke-version: ok
+  matrix-proof:
+    # The assertion job (issue #36 test plan): read THIS run's job list and prove
+    # which legs ran and which the matrix skipped. `always()` because several
+    # composed jobs are SUPPOSED to fail here (the boundary gate has no scripts/
+    # in this repo); their conclusions are the evidence, not a red run.
+    if: always()
+    needs:
+      - compose-check
+      - image-compose-check
+      - postgres-fixture
+      - worker-fixture
+      - edge-smoke-pass
+      - edge-smoke-wrong-url
+      - edge-smoke-stale-version
+      - edge-smoke-no-answer
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # the job-list endpoint needs it; everything else stays contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_ID: ${{ github.run_id }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Assert the matrix and the edge smoke from the run's job list
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/jobs" \
+            --jq '.jobs[] | [.name, .conclusion] | @tsv' > /tmp/jobs.tsv
+          echo "this run's job list:"; cat /tmp/jobs.tsv
+          expect() { # <exact composed job name> <expected conclusion>
+            local name="$1" want="$2" got
+            got=$(awk -F'\t' -v n="$name" '$1 == n {print $2; exit}' /tmp/jobs.tsv)
+            if [ -z "$got" ]; then echo "::error::job '$name' not found in run $RUN_ID"; exit 1; fi
+            if [ "$got" != "$want" ]; then echo "::error::job '$name' concluded '$got', expected '$want'"; exit 1; fi
+            echo "ok: $name -> $got"
+          }
+          ran() { # <exact composed job name> — must have executed, whatever green/red followed
+            local name="$1" got
+            got=$(awk -F'\t' -v n="$name" '$1 == n {print $2; exit}' /tmp/jobs.tsv)
+            if [ -z "$got" ]; then echo "::error::job '$name' not found in run $RUN_ID"; exit 1; fi
+            if [ "$got" = "skipped" ] || [ "$got" = "null" ]; then echo "::error::job '$name' was skipped, expected to run"; exit 1; fi
+            echo "ok: $name ran ($got) — it fails at the boundary gate here (no scripts/), which is the composition proof"
+          }
+          echo "== the matrix (which rail ran which legs) =="
+          ran "compose-check / gates"
+          ran "postgres-fixture / gates-postgres"
+          expect "postgres-fixture / gates" skipped
+          ran "worker-fixture / gates"
+          expect "worker-fixture / gates-postgres" skipped
+          expect "worker-fixture / worker-smoke" success
+          echo "== the edge smoke =="
+          expect "edge-smoke-pass / edge-smoke" success
+          expect "edge-smoke-wrong-url / edge-smoke" failure
+          expect "edge-smoke-stale-version / edge-smoke" failure
+          expect "edge-smoke-no-answer / edge-smoke" success
+          echo "== no fixture weakened a gate: the skips above are the documented matrix, nothing else =="
