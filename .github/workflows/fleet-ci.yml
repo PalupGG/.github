@@ -31,6 +31,14 @@ on:
         description: "Provision the Rust Worker test toolchain (wasm32 target + worker-build) and prove workerd boots before the gates"
         type: boolean
         default: false
+      edge-smoke-url:
+        description: "Public /healthz URL of the DEPLOYED environment, smoked through the edge after the gates (issue #36); empty (default) skips the leg. Best-effort: no answer (network blip) or a 403 from a non-allowlisted egress warns and continues; a wrong URL (non-200) or a body missing edge-smoke-version fails."
+        type: string
+        default: ""
+      edge-smoke-version:
+        description: "Version marker the deployed /healthz body must contain when edge-smoke-url is set (today the fleet contract is 'ok'; a deploy version id fits once services expose one)"
+        type: string
+        default: ""
     secrets:
       FLEET_TOKEN:
         description: "Read-only token that can fetch SanctuaryGG/kernel (not needed in the kernel repository itself)"
@@ -150,6 +158,57 @@ jobs:
       - name: wrangler log on failure
         if: failure()
         run: cat "$RUNNER_TEMP/wrangler-smoke.log" || true
+
+  edge-smoke:
+    # Issue #36: a deploy is smoked through the WAN, not only loopback. One
+    # allowlisted curl of the DEPLOYED environment's /healthz, hard-bounded
+    # (--connect-timeout/--max-time) and best-effort by design: no answer (a
+    # network blip) or a 403 from an egress the WAF does not allowlist warns and
+    # continues, while a wrong URL (non-200) or a body missing the expected
+    # version marker fails. No `needs:` on purpose — a skipped need skips the
+    # dependent, and exactly one gates leg always skips (the twin pattern below);
+    # the leg is a read-only GET that must also stay exercisable standalone,
+    # which is how the selftest calls it in THIS repo (whose gate jobs fail at
+    # the boundary step by design — no scripts/ here).
+    if: inputs.edge-smoke-url != ''
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 5
+    steps:
+      - name: Edge smoke — one allowlisted curl of the deployed /healthz
+        env:
+          EDGE_URL: ${{ inputs.edge-smoke-url }}
+          EXPECTED: ${{ inputs.edge-smoke-version }}
+        run: |
+          set -euo pipefail
+          # ONE curl, classified by the HTTP code it yields. `|| true` keeps the
+          # exit status in $code; the body lands in $body for the marker check.
+          # The rm -f first: a failed curl must not leave a PREVIOUS body behind.
+          rm -f /tmp/healthz
+          code=$(curl -sS -o /tmp/healthz -w '%{http_code}' --connect-timeout 10 --max-time 20 "$EDGE_URL" || true)
+          body=$(cat /tmp/healthz 2>/dev/null || true)
+          echo "GET $EDGE_URL -> HTTP $code"
+          echo "body: $body"
+          if [ -z "$code" ] || [ "$code" = "000" ]; then
+            echo "::warning::no answer within the timeout — network blip or egress gap; best-effort, continuing (issue #36)"
+            exit 0
+          fi
+          if [ "$code" = "403" ]; then
+            echo "::warning::403 — this runner's egress is not in the Cloudflare allowlist; verify from an allowlisted host"
+            exit 0
+          fi
+          if [ "$code" != "200" ]; then
+            echo "::error::wrong URL or broken deployment: GET $EDGE_URL answered HTTP $code, expected 200"
+            exit 1
+          fi
+          if [ -z "$EXPECTED" ]; then
+            echo "::warning::reachable and healthy (200) but no edge-smoke-version configured — only reachability was proven"
+            exit 0
+          fi
+          if ! grep -Fq -- "$EXPECTED" <<<"$body"; then
+            echo "::error::stale or wrong version marker: expected '$EXPECTED' in the /healthz body, got '$body'"
+            exit 1
+          fi
+          echo "edge smoke passed: $EDGE_URL answered 200 with the expected marker"
 
   gates-postgres:
     # The postgres opt-in. GitHub Actions has no conditional `services:` (actions/runner#822),

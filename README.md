@@ -8,7 +8,8 @@ ADR-PLT-0010 #3). Documentation of the whole pipeline lives in
 
 | Path | What |
 |---|---|
-| `.github/workflows/fleet-ci.yml` | The reusable workflow: the five gates (boundary selftest, boundary gate — service or kernel role, `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`) on the pinned toolchain, with the `FLEET_TOKEN` kernel fetch wired through the git CLI credential helper — plus an opt-in `postgres:17-alpine` service for database-backed suites. |
+| `.github/workflows/fleet-ci.yml` | The reusable workflow: the five gates (boundary selftest, boundary gate — service or kernel role, `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`) on the pinned toolchain, with the `FLEET_TOKEN` kernel fetch wired through the git CLI credential helper — plus an opt-in `postgres:17-alpine` service for database-backed suites, the Worker rail (`worker-tests` + `worker-smoke`), and an input-gated `edge-smoke` leg that curls a deployed `/healthz` through the WAN. |
+| `.github/workflows/selftest.yml` | Composition selftests for the reusable workflows: plain, Postgres and Worker fixture callers prove which legs run per rail, edge-smoke fixtures prove the smoke contract (pass, wrong URL, stale version, network blip), and `matrix-proof` asserts all of it from the run's job list. |
 | `.github/workflows/fleet-e2e.yml` | The application-level e2e workflow: builds the calling repo's crate, boots the real server (`cargo run`, background), waits for the health path, runs the repo's e2e suite against the live process — with the same `FLEET_TOKEN` wiring and `postgres:17-alpine` opt-in as fleet-ci. |
 | `runner/` | The self-hosted runner for the owned cluster: manifest + bootstrap instructions. Not applied by agents; cluster changes are founder actions. |
 
@@ -48,6 +49,52 @@ this repository and into the cluster.
 
 The SHA is bumped deliberately, in a PR, when the workflow changes — never a branch, never
 a floating tag.
+
+## The rail matrix (issue #36)
+
+One workflow, rails chosen by inputs — the Postgres split is the `gates` / `gates-postgres`
+twin (GitHub Actions has no conditional `services:`, so the twin is skipped by the matrix,
+never a weakened or copy-pasted workflow), and the Worker rail is `worker-tests` plus the
+`worker-smoke` environment proof:
+
+| Repository | fleet-ci inputs (the rail) | Legs that run |
+|---|---|---|
+| `kernel` | `kernel-role: true` | `gates` (boundary gate in kernel role) |
+| `chat` | `worker-tests: true` | `gates` + `worker-smoke` — no Postgres service (ADR-PLT-0030) |
+| `identity` | `postgres: true`, `postgres-env: IDENTITY_DATABASE_URL` | `gates-postgres`; flips to the Worker rail when its D1 port lands (ADR-PLT-0031) |
+| `marketplace` | `postgres: true`, `postgres-env: MARKETPLACE_DATABASE_URL` | `gates-postgres` |
+| `ledger` | `postgres: true`, `postgres-env: LEDGER_DATABASE_URL` | `gates-postgres` |
+| `web` | `runs-on: '["self-hosted","palupgg-build"]'` | `gates` (static-assets Worker; no database) |
+
+Why the ledger is the exception: D1 has no roles or grants, no row locks and a 10 GB ceiling
+(ADR-PLT-0029 §3), and buyer money may not move to a weaker guarantee. The ledger stays on
+Postgres until ADR-PLT-0029 §4's five money proofs pass — append-only trigger, batch
+atomicity, restore from an export, idempotent replay, reconciliation reporting zero diffs on
+a clean run while catching a seeded diff — plus DEC-0011 (nightly export to R2, a performed
+and recorded restore, reconciliation read by a human, human approval on every movement).
+Until that record changes, no matrix leg runs the ledger's gates without Postgres.
+
+The selftest proves the matrix on every push to main: the `postgres-fixture` caller must run
+`gates-postgres` and skip `gates`, the `worker-fixture` must run `gates` + `worker-smoke` and
+skip `gates-postgres`, and `matrix-proof` reads the run's job list and fails on any deviation.
+
+### Edge smoke — `edge-smoke-url` / `edge-smoke-version`
+
+A deploy is smoked through the WAN, not only loopback. A caller passes the deployed
+environment's public `/healthz` URL and the version marker its body must contain; the leg
+curls it once, hard-bounded. The contract, each line proven by a selftest fixture:
+
+| Case | Behavior |
+|---|---|
+| answered 200, body contains `edge-smoke-version` | pass (`edge-smoke-pass`) |
+| answered 404 or any other non-200 — wrong URL, broken deployment | fail (`edge-smoke-wrong-url`) |
+| answered 200, marker missing or stale | fail (`edge-smoke-stale-version`) |
+| no answer within `--connect-timeout 10` / `--max-time 20` — network blip | `::warning`, continue (`edge-smoke-no-answer`); a blip never blocks CI |
+| 403 — runner egress not in the Cloudflare WAF allowlist | `::warning`, continue (same convention as the Worker ladder's smoke) |
+
+Empty `edge-smoke-url` (the default) skips the leg, so existing callers are unaffected. Today
+the fleet contract is `/healthz` → `ok`; a deploy version id fits `edge-smoke-version` once
+services expose one. Capturing the URL at deploy time is `.github#21` (separate, still open).
 
 ## Application-level e2e — `fleet-e2e.yml`
 
