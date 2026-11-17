@@ -1,24 +1,40 @@
 name: fleet-worker-code
 
-# Build once, promote the artifact — the code-Worker ladder (ADR-PLT-0025 revision 2 §8,
+# Build once, promote the artifact — the code-Worker ladder (ADR-PLT-0025 §8–§12,
 # ADR-PLT-0028 §2).
 #
 # fleet-worker-promote.yml ships the static-asset ladder; this is its sibling for code Workers
-# that deploy a bundle (worker.js + *.wasm, whatever produced it — typically worker-build).
-# Same ladder, different artifact:
+# that deploy a bundle (worker.js + *.wasm, whatever produced it — typically
+# `worker-build --release`). Four modes, per ADR-PLT-0028 §2:
 #
-#   build    — run build_command, pack bundle_dir into a deterministic tar, digest the tar,
-#              upload the artifact (90 days), upload a Worker Version and send it 100% traffic
-#   promote  — download the artifact from a previous build run (source_run_id), re-hash it,
-#              refuse on digest mismatch, then upload a Version and send it 100% — never rebuild
-#   rollback — send a previously recorded Version 100% traffic; no artifact, no build
+#   build     — run build_command, pack bundle_dir into a deterministic tar, digest the tar,
+#               upload the artifact (90 days), upload a Worker Version and send it 100% traffic
+#               (merge to proto; `--name` per environment per ADR-PLT-0027)
+#   promote   — download the artifact from a previous build run (source_run_id), re-hash it,
+#               refuse on digest mismatch, then upload a Version and send it 100% — never rebuild
+#   reconcile — re-send a recorded Worker Version (version_id) at 100% in the SAME environment;
+#               the drift-repair path when live state does not match the record (ADR-PLT-0028 §2,
+#               §5). Version-id pinned: no artifact, no build, no migrations, no config change
+#   rollback  — point <worker_name> back at a previously recorded Version (wrangler rollback);
+#               no artifact, no build. Per ADR-PLT-0025 §12 the migrations behind the versions
+#               being swapped must be expand/contract, or code rollback is unsafe
 #
 # The digest of the artifact tar is the identity that travels between environments: Cloudflare
 # Worker Versions are scoped to one script, so a version id cannot cross Workers. That is why
 # `promote` re-downloads the build artifact instead of rebuilding.
 #
-# Ownership unchanged: wrangler owns the script/version, Terraform Cloud owns DNS, WAF and
-# the custom domain.
+# D1 at deploy time (chat's documented pattern, PalupGG/chat/.github/workflows/deploy.yml):
+# the config commits a PLACEHOLDER `database_id` (e.g. "chat-index-local"); this workflow
+# resolves the live id (`wrangler d1 info`, create only when absent), patches it in the
+# ephemeral checkout, applies migrations, deploys — and restores the placeholder before the
+# job ends, so no real id is left in any tree. The first deploy of a Worker that does not
+# exist yet remains a one-time hand bootstrap (`wrangler deploy`, ADR-PLT-0025 §10); from
+# then on this ladder owns the script/version and Terraform Cloud owns DNS, WAF and the
+# custom domain. Ownership is unchanged.
+#
+# A Worker that only reaches this ladder through a caller keeps exactly one deploy
+# definition: chat's hand-run deploy.yml becomes a thin caller of this workflow (the swap
+# itself is chat's issue, out of scope here).
 
 on:
   workflow_call:
@@ -28,7 +44,7 @@ on:
         required: true
         type: string
       worker_name:
-        description: Cloudflare Worker to deploy or roll back.
+        description: Cloudflare Worker to deploy or roll back (per environment, ADR-PLT-0027).
         required: true
         type: string
       config_path:
@@ -43,7 +59,7 @@ on:
         description: Command that produces the bundle in bundle_dir (mode=build only).
         required: false
         type: string
-        default: ""
+        default: "worker-build --release"
       cloudflare_account_id:
         description: Cloudflare account ID.
         required: true
@@ -53,7 +69,7 @@ on:
         required: true
         type: string
       mode:
-        description: 'build | promote | rollback'
+        description: 'build | promote | reconcile | rollback'
         required: true
         type: string
       source_run_id:
@@ -67,10 +83,27 @@ on:
         type: string
         default: ""
       version_id:
-        description: Worker Version to restore (mode=rollback).
+        description: Worker Version to restore (mode=rollback) or re-assert (mode=reconcile).
         required: false
         type: string
         default: ""
+      d1_database:
+        description: D1 database name resolved at deploy time (empty = the Worker has no D1).
+        required: false
+        type: string
+        default: ""
+      d1_placeholder:
+        description: >-
+          Committed placeholder database_id replaced by the live id (required with d1_database;
+          the exact form in the config is "database_id": "<placeholder>").
+        required: false
+        type: string
+        default: ""
+      d1_migrations:
+        description: Apply `wrangler d1 migrations apply --remote` after patching (build/promote).
+        required: false
+        type: boolean
+        default: false
       base_url:
         description: Optional URL to smoke-test after the deploy.
         required: false
@@ -83,7 +116,7 @@ on:
         default: '["ubuntu-latest"]'
     secrets:
       CLOUDFLARE_API_TOKEN:
-        description: Workers Scripts Edit token.
+        description: 'Workers Scripts Edit token (plus D1: Edit when d1_database is set).'
         required: true
       FLEET_TOKEN:
         description: Read token for the private kernel dependency.
@@ -91,7 +124,7 @@ on:
 
     outputs:
       version_id:
-        description: Worker Version deployed by the release job (empty for rollback).
+        description: Worker Version deployed by the release job (empty for rollback/reconcile).
         value: ${{ jobs.release.outputs.version_id }}
 
 permissions:
@@ -99,8 +132,37 @@ permissions:
   actions: read
 
 jobs:
+  validate:
+    # Every real job keys its `if` on inputs.mode, so a typo'd mode would skip
+    # everything and the run would still be green — the silent no-op this job
+    # turns into a loud failure (ADR-PLT-0028's whole point is fail-fast).
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check the mode and the inputs that mode requires
+        env:
+          MODE: ${{ inputs.mode }}
+          BUILD_COMMAND: ${{ inputs.build_command }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          EXPECTED_DIGEST: ${{ inputs.expected_digest }}
+          VERSION_ID: ${{ inputs.version_id }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            build)
+              [ -n "$BUILD_COMMAND" ] || { echo "::error::mode=build needs build_command"; exit 1; } ;;
+            promote)
+              { [ -n "$SOURCE_RUN_ID" ] && [ -n "$EXPECTED_DIGEST" ]; } || \
+                { echo "::error::mode=promote needs source_run_id and expected_digest"; exit 1; } ;;
+            reconcile|rollback)
+              [ -n "$VERSION_ID" ] || { echo "::error::mode=$MODE needs version_id"; exit 1; } ;;
+            *)
+              echo "::error::unknown mode '$MODE' — expected build | promote | reconcile | rollback"; exit 1 ;;
+          esac
+
   build:
     if: inputs.mode == 'build'
+    needs: [validate]
     runs-on: ${{ fromJSON(inputs.build_runner) }}
     timeout-minutes: 30
     outputs:
@@ -125,6 +187,12 @@ jobs:
       - name: Kernel git credential helper (FLEET_TOKEN, never logged)
         if: env.FLEET_TOKEN != ''
         run: git config --global credential.helper '!f() { echo username=x-access-token; echo password="${FLEET_TOKEN}"; }; f'
+
+      - name: Worker toolchain (wasm32 target, pinned worker-build)
+        # Same pin as fleet-ci's worker-tests opt-in; idempotent on self-hosted images.
+        run: |
+          rustup target add wasm32-unknown-unknown
+          command -v worker-build >/dev/null 2>&1 || cargo install worker-build --version 0.9.0 --locked
 
       - name: Build the Worker bundle
         run: ${{ inputs.build_command }}
@@ -156,8 +224,11 @@ jobs:
 
   release:
     # Runs for build (fresh artifact) and promote (artifact from another run, never rebuilt).
-    if: ${{ !cancelled() && (inputs.mode == 'build' || inputs.mode == 'promote') }}
-    needs: [build]
+    # This is the only job that publishes, so it is where the config invariants and the
+    # D1 resolution live. `needs.validate.result == 'success'` makes a red validate skip
+    # this job up front instead of surfacing later at artifact verify on a pool runner.
+    if: ${{ !cancelled() && needs.validate.result == 'success' && (inputs.mode == 'build' || inputs.mode == 'promote') }}
+    needs: [validate, build]
     runs-on: [self-hosted, palupgg-ci]
     timeout-minutes: 20
     environment: ${{ inputs.environment }}
@@ -168,6 +239,7 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare_account_id }}
       WORKER: ${{ inputs.worker_name }}
+      CONFIG: ${{ inputs.config_path }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (fleet pin)
 
@@ -206,6 +278,72 @@ jobs:
           mkdir -p "${{ inputs.bundle_dir }}"
           tar -xf "$tarfile" -C "${{ inputs.bundle_dir }}"
 
+      - name: Assert workers_dev and preview_urls are off (ADR-PLT-0027 §5)
+        # Both domains sit on Cloudflare's own zone, outside the deny-by-default
+        # allowlist — a config slip would silently publish there. A config that
+        # omits a key defaults to publishing it, so absence fails too. Grep-based
+        # on purpose: a comment line containing the key would also trip it, and
+        # these configs are small enough that no comment needs those words.
+        run: |
+          set -euo pipefail
+          [ -f "$CONFIG" ] || { echo "::error::config not found: $CONFIG"; exit 1; }
+          for key in workers_dev preview_urls; do
+            if grep -Eq "\"?${key}\"?[[:space:]]*[:=][[:space:]]*true" "$CONFIG"; then
+              echo "::error::${key}=true in $CONFIG — the invariant is false (ADR-PLT-0027 §5)"; exit 1
+            fi
+            if ! grep -Eq "\"?${key}\"?[[:space:]]*[:=][[:space:]]*false" "$CONFIG"; then
+              echo "::error::${key} is not explicitly false in $CONFIG — set it false or this job cannot publish"; exit 1
+            fi
+          done
+          echo "config asserts: workers_dev=false preview_urls=false"
+
+      - name: Fail fast without jq (the D1 resolve step needs it)
+        if: inputs.d1_database != ''
+        run: |
+          command -v jq >/dev/null 2>&1 || { echo "::error::jq is required by the D1 resolve step but was not found on this runner."; exit 1; }
+
+      - name: Resolve the D1 id (create only when absent)
+        if: inputs.d1_database != ''
+        env:
+          D1: ${{ inputs.d1_database }}
+        run: |
+          set -euo pipefail
+          # Keep the probe's stderr: an expired token or a network error must not
+          # masquerade as "database missing" (chat's documented pattern).
+          if ! DB_ID="$(npx --yes wrangler@4.162.0 d1 info "$D1" --json 2>"$RUNNER_TEMP/d1-info.err" | jq -er '.uuid')"; then
+            cat "$RUNNER_TEMP/d1-info.err" >&2 || true
+            echo "No '$D1' D1 database on the account — creating it."
+            npx --yes wrangler@4.162.0 d1 create "$D1"
+            DB_ID="$(npx --yes wrangler@4.162.0 d1 info "$D1" --json | jq -er '.uuid')"
+          fi
+          echo "DB_ID=$DB_ID" >> "$GITHUB_ENV"
+
+      - name: Patch database_id in the checkout from the live id
+        if: inputs.d1_database != ''
+        env:
+          PLACEHOLDER: ${{ inputs.d1_placeholder }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PLACEHOLDER" ]; then
+            echo "::error::d1_placeholder is required when d1_database is set — the committed placeholder the live id replaces."
+            exit 1
+          fi
+          # Pristine copy for the restore step: the real id lives only inside this job.
+          cp "$CONFIG" "$RUNNER_TEMP/config.pristine"
+          sed -i "s/\"database_id\": \"${PLACEHOLDER}\"/\"database_id\": \"${DB_ID}\"/" "$CONFIG"
+          grep -q "\"database_id\": \"${DB_ID}\"" "$CONFIG" || {
+            echo "::error::The live D1 id was not substituted into $CONFIG — does the committed placeholder still read \"database_id\": \"$PLACEHOLDER\"?"
+            exit 1
+          }
+
+      - name: Apply D1 migrations (remote)
+        # Before the deploy; per ADR-PLT-0025 §12 migrations must be expand/contract
+        # so version N−1 still runs against schema N.
+        if: ${{ inputs.d1_database != '' && inputs.d1_migrations }}
+        env:
+          D1: ${{ inputs.d1_database }}
+        run: npx --yes wrangler@4.162.0 d1 migrations apply "$D1" --remote --config "$CONFIG"
+
       - name: Upload Worker Version
         id: upload
         run: |
@@ -221,6 +359,26 @@ jobs:
           echo "| worker | version | commit | digest |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
           echo "| $WORKER | $version | $GITHUB_SHA | ${{ inputs.expected_digest || needs.build.outputs.digest }} |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore the placeholder database_id (never a real id in any tree)
+        # Runs after the upload because `versions upload --config` is the step that
+        # bakes the D1 binding into the Version — it must read the patched config.
+        # "Deploy that Version" and later steps read `--name` only, so restoring
+        # before them is safe. always(): a failed upload still restores the tree.
+        if: ${{ always() && inputs.d1_database != '' }}
+        env:
+          PLACEHOLDER: ${{ inputs.d1_placeholder }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$RUNNER_TEMP/config.pristine" ]; then
+            echo "no pristine copy — the patch step never ran, nothing to restore"
+            exit 0
+          fi
+          cp "$RUNNER_TEMP/config.pristine" "$CONFIG"
+          grep -q "\"database_id\": \"$PLACEHOLDER\"" "$CONFIG" || {
+            echo "::error::placeholder restore verification failed"; exit 1
+          }
+          echo "config restored: the tree keeps the placeholder, the real id lived only inside this job"
 
       - name: Deploy that Version
         run: npx --yes wrangler@4.162.0 versions deploy "${{ steps.upload.outputs.version }}@100%" --name "$WORKER"
@@ -252,8 +410,47 @@ jobs:
           fi
           [ "$code" = "200" ]
 
+  reconcile:
+    # Version-id pinned, same environment (ADR-PLT-0028 §2): make live state match
+    # the record again by re-sending the recorded Version at 100%. No artifact, no
+    # build, no migrations, no config change — the recorded bytes were already
+    # deployed once; a deployment event records the repair.
+    if: inputs.mode == 'reconcile'
+    needs: [validate]
+    runs-on: [self-hosted, palupgg-ci]
+    timeout-minutes: 15
+    environment: ${{ inputs.environment }}
+    concurrency: worker-${{ inputs.worker_name }}
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare_account_id }}
+      WORKER: ${{ inputs.worker_name }}
+      VERSION: ${{ inputs.version_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (fleet pin)
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Show the deployment history being reconciled against
+        run: npx --yes wrangler@4.162.0 deployments list --name "$WORKER" | tee /tmp/history.log
+
+      - name: Re-send the recorded Version at 100%
+        run: |
+          set -euo pipefail
+          if [ -z "$VERSION" ]; then echo "version_id is required for reconcile"; exit 1; fi
+          npx --yes wrangler@4.162.0 versions deploy "$VERSION@100%" --name "$WORKER"
+
+      - name: Confirm
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@4.162.0 deployments status --name "$WORKER" | tee /tmp/status.log
+          echo "### reconciled to $VERSION on ${{ inputs.environment }}" >> "$GITHUB_STEP_SUMMARY"
+
   rollback:
     if: inputs.mode == 'rollback'
+    needs: [validate]
     runs-on: [self-hosted, palupgg-ci]
     timeout-minutes: 15
     environment: ${{ inputs.environment }}
@@ -277,7 +474,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$VERSION" ]; then echo "version_id is required for rollback"; exit 1; fi
-          npx --yes wrangler@4.162.0 versions deploy "$VERSION@100%" --name "$WORKER"
+          npx --yes wrangler@4.162.0 rollback "$VERSION" --name "$WORKER"
 
       - name: Confirm
         run: npx --yes wrangler@4.162.0 deployments status --name "$WORKER" | tee -a "$GITHUB_STEP_SUMMARY"
