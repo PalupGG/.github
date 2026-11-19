@@ -27,7 +27,7 @@ jobs:
       contents: read  # a job-level permissions block is exhaustive: grant everything the callee needs
       packages: write # reusable workflows cannot elevate: the caller must grant what the callee needs
     with:
-      runs-on: ubuntu-latest
+      runs-on: [self-hosted, palupgg-ci]  # hosted minutes quota; bash-only selftests
       service: selftest
   release-compose-check:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -35,7 +35,7 @@ jobs:
     permissions:
       contents: write # reusable workflows cannot elevate: the caller must grant what the callee needs
     with:
-      runs-on: ubuntu-latest
+      runs-on: [self-hosted, palupgg-ci]  # hosted minutes quota; bash-only selftests
   postgres-fixture:
     # Issue #36 fixture caller on the Postgres rail: `gates` must be SKIPPED and
     # `gates-postgres` must RUN (it fails at the boundary gate here — no scripts/ —
@@ -95,7 +95,7 @@ jobs:
       - edge-smoke-wrong-url
       - edge-smoke-stale-version
       - edge-smoke-no-answer
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, palupgg-ci]  # hosted minutes quota; bash-only selftests
     permissions:
       contents: read
       actions: read # the job-list endpoint needs it; everything else stays contents: read
