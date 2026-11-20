@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: ${{ inputs.runs-on }}
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 60
     permissions:
       contents: write # create the GitHub Release object for the tag (the tag itself is founder-only)
