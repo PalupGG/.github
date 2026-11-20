@@ -1,0 +1,24 @@
+name: runner-probe
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci-pool-pyyaml:
+    runs-on: ["self-hosted","palupgg-ci"]
+    steps:
+      - name: PyYAML present (the gitops#83 gap)
+        run: python3 -c "import yaml; print('pyyaml ok', yaml.__version__)"
+      - name: jq present (the other gitops need)
+        run: command -v jq
+  build-pool-docker-musl:
+    runs-on: ["self-hosted","palupgg-build"]
+    steps:
+      - name: Docker present (the ledger/gitops twin gate)
+        run: docker --version && docker compose version
+      - name: musl present (the image-job gate)
+        run: command -v musl-gcc || echo "musl-gcc absent"
