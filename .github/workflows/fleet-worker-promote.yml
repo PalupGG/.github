@@ -75,7 +75,7 @@ on:
         description: 'JSON array of runner labels for the build job.'
         required: false
         type: string
-        default: '["ubuntu-latest"]'
+        default: '["self-hosted", "palupgg-build"]'
     secrets:
       CLOUDFLARE_API_TOKEN:
         description: Workers Scripts Edit token.

@@ -11,11 +11,11 @@ on:
       runs-on:
         description: 'JSON array of runner labels for the plain e2e job, e.g. ["ubuntu-latest"] or ["self-hosted","palupgg-build"]'
         type: string
-        default: '["ubuntu-latest"]'
+        default: '["self-hosted", "palupgg-build"]'
       postgres-runs-on:
         description: 'JSON array of runner labels for the Postgres twin (needs Docker), e.g. ["ubuntu-latest"]'
         type: string
-        default: '["ubuntu-latest"]'
+        default: '["self-hosted", "palupgg-build"]'
       postgres:
         description: "Run the e2e beside a postgres:17-alpine service and point postgres-env at it"
         type: boolean

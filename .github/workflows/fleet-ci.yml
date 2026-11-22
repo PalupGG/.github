@@ -10,11 +10,11 @@ on:
       runs-on:
         description: 'JSON array of runner labels for the plain gate job, e.g. ["ubuntu-latest"] or ["self-hosted","palupgg-build"]'
         type: string
-        default: '["ubuntu-latest"]'
+        default: '["self-hosted", "palupgg-build"]'
       postgres-runs-on:
         description: 'JSON array of runner labels for the Postgres twin (needs Docker), e.g. ["ubuntu-latest"]'
         type: string
-        default: '["ubuntu-latest"]'
+        default: '["self-hosted", "palupgg-build"]'
       postgres:
         description: "Run the gates beside a postgres:17-alpine service for database-backed suites"
         type: boolean

@@ -45,7 +45,7 @@ on:
         description: 'JSON array of runner labels for the build job, e.g. ["ubuntu-latest"] or ["self-hosted","palupgg-build"]'
         required: false
         type: string
-        default: '["ubuntu-latest"]'
+        default: '["self-hosted", "palupgg-build"]'
     secrets:
       FLEET_TOKEN:
         description: Read token for the private kernel dependency.
