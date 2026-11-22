@@ -136,7 +136,7 @@ jobs:
     # Every real job keys its `if` on inputs.mode, so a typo'd mode would skip
     # everything and the run would still be green — the silent no-op this job
     # turns into a loud failure (ADR-PLT-0028's whole point is fail-fast).
-    runs-on: '["self-hosted", "palupgg-build"]'  # default pool (probe 44956767700)
+    runs-on: [self-hosted, palupgg-build]  # default pool (probe 44956767700)
     timeout-minutes: 5
     steps:
       - name: Check the mode and the inputs that mode requires
