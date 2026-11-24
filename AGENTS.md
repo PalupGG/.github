@@ -1,9 +1,9 @@
-<!-- fleet:begin source=PalupGG/platform@main sha256=de71c1e52e358594 · edit in PalupGG/platform, never here · local rules go below fleet:end -->
+<!-- fleet:begin source=PalupGG/platform@main sha256=21253667a079a752 · edit in PalupGG/platform, never here · local rules go below fleet:end -->
 # AGENTS.md — PalupGG fleet
 
 PalupGG is a marketplace where adults book paid one-to-one gaming sessions with verified
-providers. Fourteen repositories: the five services (identity, marketplace, ledger, chat,
-web), the kernel crate, the console, rooms, gitops, the platform and headquarters
+providers. Fifteen repositories: the five services (identity, marketplace, ledger, chat,
+web), the kernel crate, the console, rooms, mail, gitops, the platform and headquarters
 documentation repositories, the `.github` workflow repository, agent-skills and the
 analysis archive. Everything above `fleet:end` is one block, distributed to the other
 repositories as sync PRs (ADR-PLT-0011); the section below it is local to this repository.
@@ -255,8 +255,10 @@ gates; there, review is the check (links, numbering, the name rule).
 - Validate at the edge: bounded lengths, control characters rejected, unknown cursors and ids
   are errors, never defaults.
 - Processor webhooks (ledger, M3): verify the signature before any write; idempotent by event id.
-- No real signups until the email processor has a signed DPA, a privacy-notice entry, a
-  scoped send-only key and send quotas (ADR-PLT-0010 #4).
+- No real signups until the email processor has a DPA in force, a privacy-notice entry and
+  send quotas (ADR-PLT-0010 #4 as re-pointed by ADR-PLT-0040 #6: the Cloudflare DPA in force
+  covers the sending service, and the "scoped send-only key" is the sender-restricted
+  `send_email` binding — no provider API key exists).
 - CI: third-party actions pinned by full SHA; `permissions: contents: read` unless a job needs
   more (`packages: write` only for the image push).
 - A new surface (webhooks, websockets, uploads) updates `platform/docs/security-threat-model.md`
