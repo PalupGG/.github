@@ -13,9 +13,9 @@ on:
         type: boolean
         default: false
       runs-on:
-        description: "Runner label — ubuntu-latest until the org runner pool exists"
+        description: "JSON array of runner labels for the gate suite"
         type: string
-        default: "ubuntu-latest"
+        default: '["self-hosted", "palupgg-build"]'
     secrets:
       FLEET_TOKEN:
         description: "Read-only token that can fetch SanctuaryGG/kernel (not needed in the kernel repository)"
