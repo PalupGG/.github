@@ -29,6 +29,19 @@ jobs:
     with:
       runs-on: '["self-hosted", "palupgg-ci"]'  # string input: fleet-image/fleet-release take a JSON-array STRING (matrix-proof keeps the bare array)
       service: selftest
+  image-default-compose-check:
+    # Issue #62: NO runs-on at all — the caller must fall through to the callee's
+    # default, which is a JSON-array STRING. A default that is not JSON makes
+    # fromJSON() throw at job setup and the composed job silently vanishes from the
+    # run (ledger's image leg did exactly that). In this repo the job must exist and
+    # fail at a real step (no Cargo.toml; the build pool has no passwordless sudo),
+    # which is composition proven; matrix-proof asserts it below.
+    uses: PalupGG/.github/.github/workflows/fleet-image.yml@main
+    permissions:
+      contents: read  # a job-level permissions block is exhaustive: grant everything the callee needs
+      packages: write # reusable workflows cannot elevate: the caller must grant what the callee needs
+    with:
+      service: selftest
   release-compose-check:
     if: startsWith(github.ref, 'refs/tags/v')
     uses: PalupGG/.github/.github/workflows/fleet-release.yml@main
@@ -36,6 +49,15 @@ jobs:
       contents: write # reusable workflows cannot elevate: the caller must grant what the callee needs
     with:
       runs-on: '["self-hosted", "palupgg-ci"]'  # string input: fleet-image/fleet-release take a JSON-array STRING (matrix-proof keeps the bare array)
+  release-default-compose-check:
+    # Issue #62, release half: NO runs-on — same default-pool proof as
+    # image-default-compose-check. Tag-only, like release-compose-check; on a tag
+    # the composed job exists and fails at a real step here (no scripts/, no
+    # Cargo.toml), which matrix-proof asserts on tag refs.
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: PalupGG/.github/.github/workflows/fleet-release.yml@main
+    permissions:
+      contents: write # reusable workflows cannot elevate: the caller must grant what the callee needs
   postgres-fixture:
     # Issue #36 fixture caller on the Postgres rail: `gates` must be SKIPPED and
     # `gates-postgres` must RUN (it fails at the boundary gate here — no scripts/ —
@@ -89,6 +111,8 @@ jobs:
     needs:
       - compose-check
       - image-compose-check
+      - image-default-compose-check
+      - release-default-compose-check
       - postgres-fixture
       - worker-fixture
       - edge-smoke-pass
@@ -131,6 +155,15 @@ jobs:
           ran "worker-fixture / gates"
           expect "worker-fixture / gates-postgres" skipped
           expect "worker-fixture / worker-smoke" success
+          echo "== the default-pool compose proofs (#62: runs-on omitted) =="
+          expect "image-default-compose-check / image" failure
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            expect "release-default-compose-check / release" failure
+          else
+            # tag-only fixture, like release-compose-check; its absence off tags is
+            # the documented matrix, not a vanished job
+            echo "release-default-compose-check is tag-only; not asserted on $GITHUB_REF"
+          fi
           echo "== the edge smoke =="
           expect "edge-smoke-pass / edge-smoke" success
           expect "edge-smoke-wrong-url / edge-smoke" failure
